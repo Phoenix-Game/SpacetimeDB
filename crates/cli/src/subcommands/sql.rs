@@ -1,10 +1,12 @@
+use std::time::Instant;
+
 use crate::api::{from_json_seed, ClientApi, Connection, StmtResultJson};
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches};
+use itertools::Itertools;
 use reqwest::RequestBuilder;
 use spacetimedb_lib::de::serde::SeedWrapper;
 use spacetimedb_lib::sats::{satn, Typespace};
-use tabled::builder::Builder;
-use tabled::Style;
+use tabled::settings::Style;
 
 use crate::config::Config;
 use crate::util::{database_address, get_auth_header_only};
@@ -67,13 +69,25 @@ pub(crate) async fn parse_req(mut config: Config, args: &ArgMatches) -> Result<C
 
     Ok(Connection {
         host: config.get_host_url(server)?,
-        auth_header: get_auth_header_only(&mut config, anon_identity, as_identity, server).await,
+        auth_header: get_auth_header_only(&mut config, anon_identity, as_identity, server).await?,
         address: database_address(&config, database, server).await?,
         database: database.to_string(),
     })
 }
 
-pub(crate) async fn run_sql(builder: RequestBuilder, sql: &str) -> Result<(), anyhow::Error> {
+// Need to report back timings from each query from the backend instead of infer here...
+fn print_row_count(rows: usize) -> String {
+    let txt = if rows == 1 { "row" } else { "rows" };
+    format!("({rows} {txt})")
+}
+
+fn print_timings(now: Instant) {
+    println!("Time: {:.2?}", now.elapsed());
+}
+
+pub(crate) async fn run_sql(builder: RequestBuilder, sql: &str, with_stats: bool) -> Result<(), anyhow::Error> {
+    let now = Instant::now();
+
     let json = builder
         .body(sql.to_owned())
         .send()
@@ -86,44 +100,57 @@ pub(crate) async fn run_sql(builder: RequestBuilder, sql: &str) -> Result<(), an
 
     // Print only `OK for empty tables as it's likely a command like `INSERT`.
     if stmt_result_json.is_empty() {
+        if with_stats {
+            print_timings(now);
+        }
         println!("OK");
         return Ok(());
     };
 
-    for (i, stmt_result) in stmt_result_json.iter().enumerate() {
-        let StmtResultJson { schema, rows } = &stmt_result;
-
-        let mut builder = Builder::default();
-        builder.set_columns(
-            schema
-                .elements
-                .iter()
-                .enumerate()
-                .map(|(i, e)| e.name.clone().unwrap_or_else(|| format!("column {i}"))),
-        );
-
-        let typespace = Typespace::default();
-        let ty = typespace.with_type(schema);
-        for row in rows {
-            let row = from_json_seed(row.get(), SeedWrapper(ty))?;
-            builder.add_record(
-                row.elements
-                    .iter()
-                    .zip(&schema.elements)
-                    .map(|(v, e)| satn::PsqlWrapper(ty.with(&e.algebraic_type).with_value(v))),
-            );
-        }
-
-        let table = builder.build().with(Style::psql());
-
-        if i > 0 {
-            println!("\n{}", table);
-        } else {
-            println!("{}", table);
-        }
+    stmt_result_json
+        .iter()
+        .map(|stmt_result| {
+            let mut table = stmt_result_to_table(stmt_result)?;
+            if with_stats {
+                // The `tabled::count_rows` add the header as a row, so subtract it.
+                let row_count = print_row_count(table.count_rows().wrapping_sub(1));
+                table.with(tabled::settings::panel::Footer::new(row_count));
+            }
+            anyhow::Ok(table)
+        })
+        .process_results(|it| println!("{}", it.format("\n\n")))?;
+    if with_stats {
+        print_timings(now);
     }
 
     Ok(())
+}
+
+fn stmt_result_to_table(stmt_result: &StmtResultJson) -> anyhow::Result<tabled::Table> {
+    let StmtResultJson { schema, rows } = stmt_result;
+
+    let mut builder = tabled::builder::Builder::default();
+    builder.set_header(
+        schema
+            .elements
+            .iter()
+            .enumerate()
+            .map(|(i, e)| e.name.clone().unwrap_or_else(|| format!("column {i}"))),
+    );
+
+    let ty = Typespace::EMPTY.with_type(schema);
+    for row in rows {
+        let row = from_json_seed(row.get(), SeedWrapper(ty))?;
+        builder.push_record(
+            ty.with_values(&row)
+                .map(|col_val| satn::PsqlWrapper(col_val).to_string()),
+        );
+    }
+
+    let mut table = builder.build();
+    table.with(Style::psql());
+
+    Ok(table)
 }
 
 pub async fn exec(config: Config, args: &ArgMatches) -> Result<(), anyhow::Error> {
@@ -138,7 +165,7 @@ pub async fn exec(config: Config, args: &ArgMatches) -> Result<(), anyhow::Error
         let con = parse_req(config, args).await?;
         let api = ClientApi::new(con);
 
-        run_sql(api.sql(), query).await?;
+        run_sql(api.sql(), query, false).await?;
     }
     Ok(())
 }

@@ -9,8 +9,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::config::Config;
+use crate::util::unauth_error_context;
 use crate::util::{add_auth_header_opt, get_auth_header};
-use crate::util::{init_default, unauth_error_context};
 
 pub fn cli() -> clap::Command {
     clap::Command::new("publish")
@@ -19,8 +19,8 @@ pub fn cli() -> clap::Command {
             Arg::new("host_type")
                 .long("host-type")
                 .short('t')
-                .value_parser(["wasmer"])
-                .default_value("wasmer")
+                .value_parser(["wasm"])
+                .default_value("wasm")
                 .help("The type of host that should be for hosting this module"),
         )
         .arg(
@@ -97,9 +97,8 @@ pub fn cli() -> clap::Command {
 }
 
 pub async fn exec(mut config: Config, args: &ArgMatches) -> Result<(), anyhow::Error> {
-    let cloned_config = config.clone();
     let server = args.get_one::<String>("server").map(|s| s.as_str());
-    let identity = cloned_config.resolve_name_to_identity(args.get_one::<String>("identity").map(|s| s.as_str()))?;
+    let identity = args.get_one::<String>("identity").map(String::as_str);
     let name_or_address = args.get_one::<String>("name|address");
     let path_to_project = args.get_one::<PathBuf>("path_to_project").unwrap();
     let host_type = args.get_one::<String>("host_type").unwrap();
@@ -108,6 +107,7 @@ pub async fn exec(mut config: Config, args: &ArgMatches) -> Result<(), anyhow::E
     let anon_identity = args.get_flag("anon_identity");
     let skip_clippy = args.get_flag("skip_clippy");
     let build_debug = args.get_flag("debug");
+    let database_host = config.get_host_url(server)?;
 
     let mut query_params = Vec::<(&str, &str)>::new();
     query_params.push(("host_type", host_type.as_str()));
@@ -137,11 +137,20 @@ pub async fn exec(mut config: Config, args: &ArgMatches) -> Result<(), anyhow::E
         query_params.push(("trace_log", "true"));
     }
 
-    let path_to_wasm = crate::tasks::build(path_to_project, skip_clippy, build_debug)?;
+    let path_to_wasm = if !path_to_project.is_dir() && path_to_project.extension().map_or(false, |ext| ext == "wasm") {
+        path_to_project.clone()
+    } else {
+        crate::tasks::build(path_to_project, skip_clippy, build_debug)?
+    };
     let program_bytes = fs::read(path_to_wasm)?;
+    println!(
+        "Uploading to {} => {}",
+        server.unwrap_or(config.default_server_name().unwrap_or("<default>")),
+        database_host
+    );
 
     let mut builder = reqwest::Client::new().post(Url::parse_with_params(
-        format!("{}/database/publish", config.get_host_url(server)?).as_str(),
+        format!("{}/database/publish", database_host).as_str(),
         query_params,
     )?);
 
@@ -149,20 +158,12 @@ pub async fn exec(mut config: Config, args: &ArgMatches) -> Result<(), anyhow::E
     // we want to use the default identity
     // TODO(jdetter): We should maybe have some sort of user prompt here for them to be able to
     //  easily create a new identity with an email
-    let identity = if !anon_identity {
-        if identity.is_none() && config.default_identity(server).is_err() {
-            init_default(&mut config, None, server).await?;
-        }
 
-        let (auth_header, chosen_identity) = get_auth_header(&mut config, anon_identity, identity.as_deref(), server)
-            .await
-            .unzip();
+    let (auth_header, identity) = get_auth_header(&mut config, anon_identity, identity, server)
+        .await?
+        .unzip();
 
-        builder = add_auth_header_opt(builder, &auth_header);
-        chosen_identity
-    } else {
-        None
-    };
+    builder = add_auth_header_opt(builder, &auth_header);
 
     let res = builder.body(program_bytes).send().await?;
     if res.status() == StatusCode::UNAUTHORIZED && !anon_identity {

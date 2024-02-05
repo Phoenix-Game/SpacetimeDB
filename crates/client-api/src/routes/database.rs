@@ -1,7 +1,7 @@
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::response::{ErrorResponse, IntoResponse};
-use axum::{headers, TypedHeader};
+use axum_extra::TypedHeader;
 use chrono::Utc;
 use futures::StreamExt;
 use http::StatusCode;
@@ -19,7 +19,7 @@ use spacetimedb::host::ReducerOutcome;
 use spacetimedb::host::UpdateDatabaseSuccess;
 use spacetimedb::identity::Identity;
 use spacetimedb::json::client_api::StmtResultJson;
-use spacetimedb::messages::control_db::{Database, DatabaseInstance, HostType};
+use spacetimedb::messages::control_db::{Database, DatabaseInstance};
 use spacetimedb::sql::execute::execute;
 use spacetimedb_lib::address::AddressForUrl;
 use spacetimedb_lib::identity::AuthCtx;
@@ -386,12 +386,10 @@ pub async fn info<S: ControlStateDelegate>(
         .ok_or((StatusCode::NOT_FOUND, "No such database."))?;
     log::trace!("Fetched database from the worker db for address: {address:?}");
 
-    let host_type = match database.host_type {
-        HostType::Wasmer => "wasmer",
-    };
+    let host_type: &str = database.host_type.as_ref();
     let response_json = json!({
-        "address": database.address.to_hex(),
-        "identity": database.identity.to_hex(),
+        "address": database.address,
+        "identity": database.identity,
         "host_type": host_type,
         "num_replicas": database.num_replicas,
         "program_bytes_address": database.program_bytes_address,
@@ -489,9 +487,9 @@ where
             .chain(stream)
             .map(Ok::<_, std::convert::Infallible>);
 
-        axum::body::boxed(axum::body::StreamBody::new(stream))
+        Body::from_stream(stream)
     } else {
-        axum::body::boxed(axum::body::Full::from(lines))
+        Body::from(lines)
     };
 
     Ok((
@@ -613,10 +611,7 @@ pub async fn dns<S: ControlStateDelegate>(
     let domain = database_name.parse().map_err(DomainParsingRejection)?;
     let address = ctx.lookup_address(&domain).map_err(log_and_500)?;
     let response = if let Some(address) = address {
-        DnsLookupResponse::Success {
-            domain,
-            address: address.to_hex(),
-        }
+        DnsLookupResponse::Success { domain, address }
     } else {
         DnsLookupResponse::Failure { domain }
     };
@@ -692,7 +687,7 @@ pub async fn request_recovery_code<S: NodeDelegate + ControlStateDelegate>(
     let recovery_code = RecoveryCode {
         code: code.clone(),
         generation_time: Utc::now(),
-        identity: identity.to_hex(),
+        identity,
     };
     ctx.insert_recovery_code(&identity, email.as_str(), recovery_code)
         .await
@@ -734,7 +729,7 @@ pub async fn confirm_recovery_code<S: ControlStateDelegate + NodeDelegate>(
     }
 
     // Make sure the identity provided by the request matches the recovery code registration
-    if recovery_code.identity != identity.to_hex() {
+    if recovery_code.identity != identity {
         return Err((
             StatusCode::BAD_REQUEST,
             "Recovery code doesn't match the provided identity.",
@@ -754,10 +749,7 @@ pub async fn confirm_recovery_code<S: ControlStateDelegate + NodeDelegate>(
 
     // Recovery code is verified, return the identity and token to the user
     let token = encode_token(ctx.private_key(), identity).map_err(log_and_500)?;
-    let result = RecoveryCodeResponse {
-        identity: identity.to_hex(),
-        token,
-    };
+    let result = RecoveryCodeResponse { identity, token };
 
     Ok(axum::Json(result))
 }
@@ -864,7 +856,7 @@ pub async fn publish<S: NodeDelegate + ControlStateDelegate>(
 
     Ok(axum::Json(PublishResult::Success {
         domain: db_name.as_ref().map(ToString::to_string),
-        address: db_addr.to_hex(),
+        address: db_addr,
         op,
     }))
 }

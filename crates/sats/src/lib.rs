@@ -1,16 +1,24 @@
 pub mod algebraic_type;
 mod algebraic_type_ref;
 pub mod algebraic_value;
+pub mod array_type;
+pub mod array_value;
 pub mod bsatn;
 pub mod buffer;
 pub mod builtin_type;
-pub mod builtin_value;
 pub mod convert;
+pub mod data_key;
+pub mod db;
 pub mod de;
+pub mod hash;
+pub mod hex;
+pub mod map_type;
+pub mod map_value;
 pub mod meta_type;
 pub mod product_type;
 pub mod product_type_element;
 pub mod product_value;
+pub mod relation;
 mod resolve_refs;
 pub mod satn;
 pub mod ser;
@@ -21,9 +29,13 @@ pub mod typespace;
 
 pub use algebraic_type::AlgebraicType;
 pub use algebraic_type_ref::AlgebraicTypeRef;
-pub use algebraic_value::AlgebraicValue;
-pub use builtin_type::{ArrayType, BuiltinType, MapType};
-pub use builtin_value::{ArrayValue, BuiltinValue, MapValue};
+pub use algebraic_value::{AlgebraicValue, F32, F64};
+pub use array_type::ArrayType;
+pub use array_value::ArrayValue;
+pub use builtin_type::BuiltinType;
+pub use data_key::{DataKey, ToDataKey};
+pub use map_type::MapType;
+pub use map_value::MapValue;
 pub use product_type::ProductType;
 pub use product_type_element::ProductTypeElement;
 pub use product_value::ProductValue;
@@ -74,6 +86,10 @@ impl<'a, T: Value> ValueWithType<'a, T> {
     /// Returns the type of the value.
     pub fn ty(&self) -> &'a T::Type {
         self.ty.ty
+    }
+
+    pub fn ty_s(&self) -> WithTypespace<'a, T::Type> {
+        self.ty
     }
 
     /// Returns the typing context (`Typespace`).
@@ -142,6 +158,13 @@ impl<'a, T: ?Sized> WithTypespace<'a, T> {
         }
     }
 
+    pub(crate) fn iter_with<U: 'a, I: IntoIterator<Item = &'a U>>(&self, tys: I) -> IterWithTypespace<'a, I::IntoIter> {
+        IterWithTypespace {
+            typespace: self.typespace,
+            iter: tys.into_iter(),
+        }
+    }
+
     /// Wraps `val` with the type and typespace context in `self`.
     pub fn with_value<'b, V: Value<Type = T>>(&self, val: &'b V) -> ValueWithType<'b, V>
     where
@@ -169,5 +192,32 @@ impl<'a, T: ?Sized> WithTypespace<'a, T> {
             typespace: self.typespace,
             ty: f(self.ty),
         }
+    }
+}
+
+pub struct IterWithTypespace<'a, I> {
+    typespace: &'a Typespace,
+    iter: I,
+}
+
+impl<'a, I, T: 'a> Iterator for IterWithTypespace<'a, I>
+where
+    I: Iterator<Item = &'a T>,
+{
+    type Item = WithTypespace<'a, T>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(|ty| self.typespace.with_type(ty))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<'a, I, T: 'a> ExactSizeIterator for IterWithTypespace<'a, I>
+where
+    I: ExactSizeIterator<Item = &'a T>,
+{
+    fn len(&self) -> usize {
+        self.iter.len()
     }
 }

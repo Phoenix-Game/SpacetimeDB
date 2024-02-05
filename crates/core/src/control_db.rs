@@ -5,10 +5,9 @@ use anyhow::{anyhow, Context};
 use crate::address::Address;
 
 use crate::hash::hash_bytes;
-use crate::host::EnergyQuanta;
 use crate::identity::Identity;
 use crate::messages::control_db::{Database, DatabaseInstance, EnergyBalance, IdentityEmail, Node};
-use crate::stdb_path;
+use crate::{energy, stdb_path};
 
 use spacetimedb_lib::name::{DomainName, DomainParsingError, InsertDomainResult, RegisterTldResult, Tld, TldRef};
 use spacetimedb_lib::recovery::RecoveryCode;
@@ -17,6 +16,7 @@ use spacetimedb_sats::bsatn;
 #[cfg(test)]
 mod tests;
 
+#[derive(Clone)]
 pub struct ControlDb {
     db: sled::Db,
 }
@@ -32,7 +32,7 @@ pub enum Error {
     #[error("record with the name {0} already exists")]
     RecordAlreadyExists(DomainName),
     #[error("database with address {0} already exists")]
-    DatabaseAlreadyExists(String),
+    DatabaseAlreadyExists(Address),
     #[error("failed to register {0} domain")]
     DomainRegistrationFailure(DomainName),
     #[error("failed to decode data")]
@@ -119,6 +119,7 @@ impl ControlDb {
         owner_identity: Identity,
         try_register_tld: bool,
     ) -> Result<InsertDomainResult> {
+        let address = *address;
         if self.spacetime_dns(&domain)?.is_some() {
             return Err(Error::RecordAlreadyExists(domain));
         }
@@ -160,10 +161,7 @@ impl ControlDb {
             }
         }
 
-        Ok(InsertDomainResult::Success {
-            domain,
-            address: address.to_hex(),
-        })
+        Ok(InsertDomainResult::Success { domain, address })
     }
 
     /// Inserts a top level domain that will be owned by `owner_identity`.
@@ -293,6 +291,19 @@ impl ControlDb {
         Ok(result)
     }
 
+    pub fn get_emails_for_identity(&self, identity: &Identity) -> Result<Vec<IdentityEmail>> {
+        let mut result = Vec::<IdentityEmail>::new();
+        let tree = self.db.open_tree("email")?;
+        for i in tree.iter() {
+            let (_, value) = i?;
+            let iemail: IdentityEmail = bsatn::from_slice(&value)?;
+            if &iemail.identity == identity {
+                result.push(iemail);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn get_databases(&self) -> Result<Vec<Database>> {
         let tree = self.db.open_tree("database")?;
         let mut databases = Vec::new();
@@ -330,8 +341,8 @@ impl ControlDb {
         let tree = self.db.open_tree("database_by_address")?;
 
         let key = database.address.to_hex();
-        if tree.contains_key(key.as_bytes())? {
-            return Err(Error::DatabaseAlreadyExists(key));
+        if tree.contains_key(key)? {
+            return Err(Error::DatabaseAlreadyExists(database.address));
         }
 
         database.id = id;
@@ -356,7 +367,7 @@ impl ControlDb {
             let old_database: Database = bsatn::from_slice(&old_value[..])?;
 
             if database.address != old_database.address && tree_by_address.contains_key(key.as_bytes())? {
-                return Err(Error::DatabaseAlreadyExists(key));
+                return Err(Error::DatabaseAlreadyExists(database.address));
             }
         }
 
@@ -528,7 +539,11 @@ impl ControlDb {
                 }
             };
             let Ok(arr) = <[u8; 16]>::try_from(balance_entry.1.as_ref()) else {
-                return Err(Error::DecodingError(bsatn::DecodeError::BufferLength));
+                return Err(Error::DecodingError(bsatn::DecodeError::BufferLength {
+                    for_type: "balance_entry".into(),
+                    expected: 16,
+                    given: balance_entry.1.len(),
+                }));
             };
             let balance = i128::from_be_bytes(arr);
             let energy_balance = EnergyBalance {
@@ -543,15 +558,19 @@ impl ControlDb {
     /// Return the current budget for a given identity as stored in the db.
     /// Note: this function is for the stored budget only and should *only* be called by functions in
     /// `control_budget`, where a cached copy is stored along with business logic for managing it.
-    pub fn get_energy_balance(&self, identity: &Identity) -> Result<Option<EnergyQuanta>> {
+    pub fn get_energy_balance(&self, identity: &Identity) -> Result<Option<energy::EnergyBalance>> {
         let tree = self.db.open_tree("energy_budget")?;
         let value = tree.get(identity.as_bytes())?;
         if let Some(value) = value {
             let Ok(arr) = <[u8; 16]>::try_from(value.as_ref()) else {
-                return Err(Error::DecodingError(bsatn::DecodeError::BufferLength));
+                return Err(Error::DecodingError(bsatn::DecodeError::BufferLength {
+                    for_type: "Identity".into(),
+                    expected: 16,
+                    given: value.as_ref().len(),
+                }));
             };
             let balance = i128::from_be_bytes(arr);
-            Ok(Some(EnergyQuanta(balance)))
+            Ok(Some(energy::EnergyBalance::new(balance)))
         } else {
             Ok(None)
         }
@@ -560,9 +579,9 @@ impl ControlDb {
     /// Update the stored current budget for a identity.
     /// Note: this function is for the stored budget only and should *only* be called by functions in
     /// `control_budget`, where a cached copy is stored along with business logic for managing it.
-    pub fn set_energy_balance(&self, identity: Identity, energy_balance: EnergyQuanta) -> Result<()> {
+    pub fn set_energy_balance(&self, identity: Identity, energy_balance: energy::EnergyBalance) -> Result<()> {
         let tree = self.db.open_tree("energy_budget")?;
-        tree.insert(identity.as_bytes(), &energy_balance.0.to_be_bytes())?;
+        tree.insert(identity.as_bytes(), &energy_balance.get().to_be_bytes())?;
 
         Ok(())
     }

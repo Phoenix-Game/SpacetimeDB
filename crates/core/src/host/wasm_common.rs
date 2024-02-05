@@ -1,7 +1,13 @@
 pub mod abi;
+pub mod instrumentation;
 pub mod module_host_actor;
 
+use std::time::Instant;
+
+use super::AbiCall;
 use crate::error::{DBError, IndexError, NodesError};
+use spacetimedb_sats::typespace::TypeRefError;
+use spacetimedb_table::table::UniqueConstraintViolation;
 
 pub const CALL_REDUCER_DUNDER: &str = "__call_reducer__";
 
@@ -15,11 +21,6 @@ pub const SETUP_DUNDER: &str = "__setup__";
 pub const INIT_DUNDER: &str = "__init__";
 /// the reducer with this name is invoked when updating the database
 pub const UPDATE_DUNDER: &str = "__update__";
-pub const IDENTITY_CONNECTED_DUNDER: &str = "__identity_connected__";
-pub const IDENTITY_DISCONNECTED_DUNDER: &str = "__identity_disconnected__";
-
-pub const STDB_ABI_SYM: &str = "SPACETIME_ABI_VERSION";
-pub const STDB_ABI_IS_ADDR_SYM: &str = "SPACETIME_ABI_VERSION_IS_ADDR";
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[allow(unused)]
@@ -69,7 +70,7 @@ macro_rules! type_eq {
         }
     };
 }
-type_eq!(wasmer::Type);
+type_eq!(wasmtime::ValType);
 
 #[derive(Debug)]
 pub struct FuncSig<T: AsRef<[WasmType]>> {
@@ -83,22 +84,22 @@ impl StaticFuncSig {
         Self { params, results }
     }
 }
-impl<T: AsRef<[WasmType]>> PartialEq<FuncSig<T>> for wasmer::ExternType {
+impl<T: AsRef<[WasmType]>> PartialEq<FuncSig<T>> for wasmtime::ExternType {
     fn eq(&self, other: &FuncSig<T>) -> bool {
         self.func().map_or(false, |f| {
-            f.params() == other.params.as_ref() && f.results() == other.results.as_ref()
+            f.params().eq(other.params.as_ref()) && f.results().eq(other.results.as_ref())
         })
     }
 }
-impl FuncSigLike for wasmer::ExternType {
+impl FuncSigLike for wasmtime::ExternType {
     fn to_func_sig(&self) -> Option<BoxFuncSig> {
         self.func().map(|f| FuncSig {
-            params: f.params().iter().map(|t| (*t).into()).collect(),
-            results: f.results().iter().map(|t| (*t).into()).collect(),
+            params: f.params().map(Into::into).collect(),
+            results: f.results().map(Into::into).collect(),
         })
     }
     fn is_memory(&self) -> bool {
-        matches!(self, wasmer::ExternType::Memory(_))
+        matches!(self, wasmtime::ExternType::Memory(_))
     }
 }
 
@@ -122,14 +123,6 @@ const CALL_REDUCER_SIG: StaticFuncSig = FuncSig::new(
         WasmType::I32, // Result buffer
     ],
 );
-const CONN_DISCONN_SIG: StaticFuncSig = FuncSig::new(
-    &[
-        WasmType::I32, // Sender `Identity` buffer
-        WasmType::I32, // Sender `Address` buffer
-        WasmType::I64, // Timestamp
-    ],
-    &[WasmType::I32],
-);
 
 #[derive(thiserror::Error, Debug)]
 pub enum ValidationError {
@@ -150,12 +143,12 @@ pub enum ValidationError {
     NoMemory,
     #[error("there should be a function called {name:?} but it does not exist")]
     NoFunction { name: &'static str },
+    #[error(transparent)]
+    TypeRef(#[from] TypeRefError),
 }
 
 #[derive(Default)]
 pub struct FuncNames {
-    pub conn: bool,
-    pub disconn: bool,
     pub preinits: Vec<String>,
 }
 impl FuncNames {
@@ -187,13 +180,7 @@ impl FuncNames {
     where
         T: FuncSigLike,
     {
-        if sym == IDENTITY_CONNECTED_DUNDER {
-            Self::validate_signature("conn/disconn", ty, sym, CONN_DISCONN_SIG)?;
-            self.conn = true;
-        } else if sym == IDENTITY_DISCONNECTED_DUNDER {
-            Self::validate_signature("conn/disconn", ty, sym, CONN_DISCONN_SIG)?;
-            self.disconn = true;
-        } else if sym == SETUP_DUNDER {
+        if sym == SETUP_DUNDER {
             Self::validate_signature("setup", ty, sym, INIT_SIG)?;
         } else if let Some(name) = sym.strip_prefix(PREINIT_DUNDER) {
             Self::validate_signature("preinit", ty, name, PREINIT_SIG)?;
@@ -226,8 +213,8 @@ impl FuncNames {
 #[error(transparent)]
 pub enum ModuleCreationError {
     WasmCompileError(anyhow::Error),
-    Abi(#[from] abi::AbiVersionError),
     Init(#[from] module_host_actor::InitializationError),
+    Abi(#[from] abi::AbiVersionError),
 }
 
 pub trait ResourceIndex {
@@ -238,7 +225,7 @@ pub trait ResourceIndex {
 
 macro_rules! decl_index {
     ($name:ident => $resource:ty) => {
-        #[derive(Copy, Clone, wasmer::ValueType)]
+        #[derive(Copy, Clone)]
         #[repr(transparent)]
         pub(super) struct $name(pub u32);
 
@@ -249,6 +236,15 @@ macro_rules! decl_index {
             }
             fn to_u32(&self) -> u32 {
                 self.0
+            }
+        }
+
+        impl $name {
+            // for WasmPointee to work in crate::host::wasmtime
+            #[allow(unused)]
+            #[doc(hidden)]
+            pub(super) fn to_le_bytes(self) -> [u8; 4] {
+                self.0.to_le_bytes()
             }
         }
     };
@@ -300,8 +296,25 @@ impl BufferIdx {
     }
 }
 
-decl_index!(BufferIterIdx => Box<dyn Iterator<Item = Result<bytes::Bytes, NodesError>> + Send + Sync>);
+decl_index!(BufferIterIdx => std::vec::IntoIter<Box<[u8]>>);
 pub(super) type BufferIters = ResourceSlab<BufferIterIdx>;
+
+pub(super) struct TimingSpan {
+    pub start: Instant,
+    pub name: Vec<u8>,
+}
+
+impl TimingSpan {
+    pub fn new(name: Vec<u8>) -> Self {
+        Self {
+            start: Instant::now(),
+            name,
+        }
+    }
+}
+
+decl_index!(TimingSpanIdx => TimingSpan);
+pub(super) type TimingSpanSet = ResourceSlab<TimingSpanIdx>;
 
 pub mod errnos {
     /// NOTE! This is copied from the bindings-sys crate.
@@ -341,12 +354,12 @@ pub fn err_to_errno(err: &NodesError) -> Option<u16> {
         }
         NodesError::AlreadyExists(_) => Some(errnos::UNIQUE_ALREADY_EXISTS),
         NodesError::Internal(internal) => match **internal {
-            DBError::Index(IndexError::UniqueConstraintViolation {
+            DBError::Index(IndexError::UniqueConstraintViolation(UniqueConstraintViolation {
                 constraint_name: _,
                 table_name: _,
-                col_names: _,
+                cols: _,
                 value: _,
-            }) => Some(errnos::UNIQUE_ALREADY_EXISTS),
+            })) => Some(errnos::UNIQUE_ALREADY_EXISTS),
             _ => None,
         },
         _ => None,
@@ -356,7 +369,7 @@ pub fn err_to_errno(err: &NodesError) -> Option<u16> {
 #[derive(Debug, thiserror::Error)]
 #[error("runtime error calling {func}: {err}")]
 pub struct AbiRuntimeError {
-    pub func: &'static str,
+    pub func: AbiCall,
     #[source]
     pub err: NodesError,
 }

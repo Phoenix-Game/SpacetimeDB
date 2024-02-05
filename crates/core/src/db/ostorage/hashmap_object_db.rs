@@ -186,6 +186,10 @@ impl ObjectDB for HashMapObjectDB {
         }
         Ok(())
     }
+
+    fn size_on_disk(&self) -> Result<u64, DBError> {
+        Ok(self.total_mem_size_bytes())
+    }
 }
 
 fn hex_prefixes() -> Vec<String> {
@@ -208,14 +212,14 @@ mod tests {
     use crate::error::DBError;
     use crate::hash::hash_bytes;
     use spacetimedb_lib::error::ResultTest;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     const TEST_DB_DIR_PREFIX: &str = "objdb_test";
     const TEST_DATA1: &[u8; 21] = b"this is a byte string";
     const TEST_DATA2: &[u8; 26] = b"this is also a byte string";
 
     fn setup() -> Result<(HashMapObjectDB, TempDir), DBError> {
-        let tmp_dir = TempDir::new(TEST_DB_DIR_PREFIX).unwrap();
+        let tmp_dir = TempDir::with_prefix(TEST_DB_DIR_PREFIX).unwrap();
         let db = HashMapObjectDB::open(tmp_dir.path())?;
         Ok((db, tmp_dir))
     }

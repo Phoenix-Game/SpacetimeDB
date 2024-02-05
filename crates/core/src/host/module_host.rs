@@ -1,10 +1,24 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use base64::{engine::general_purpose::STANDARD as BASE_64_STD, Engine as _};
+use futures::{Future, FutureExt};
+use indexmap::IndexMap;
+use tokio::sync::oneshot;
+
 use super::host_controller::HostThreadpool;
-use super::{ArgsTuple, EnergyDiff, InvalidReducerArguments, ReducerArgs, ReducerCallResult, Timestamp};
+use super::{ArgsTuple, InvalidReducerArguments, ReducerArgs, ReducerCallResult, ReducerId, Timestamp};
 use crate::client::ClientConnectionSender;
 use crate::database_logger::LogLevel;
-use crate::db::datastore::traits::{TableId, TxData, TxOp};
+use crate::db::datastore::traits::{TxData, TxOp};
 use crate::db::relational_db::RelationalDB;
+use crate::db::update::UpdateDatabaseError;
+use crate::energy::EnergyQuanta;
 use crate::error::DBError;
+use crate::execution_context::ExecutionContext;
 use crate::hash::Hash;
 use crate::identity::Identity;
 use crate::json::client_api::{SubscriptionUpdateJson, TableRowOperationJson, TableUpdateJson};
@@ -12,17 +26,10 @@ use crate::protobuf::client_api::{table_row_operation, SubscriptionUpdate, Table
 use crate::subscription::module_subscription_actor::ModuleSubscriptionManager;
 use crate::util::lending_pool::{Closed, LendingPool, LentResource, PoolClosed};
 use crate::util::notify_once::NotifyOnce;
-use base64::{engine::general_purpose::STANDARD as BASE_64_STD, Engine as _};
-use futures::{Future, FutureExt};
-use indexmap::IndexMap;
-use spacetimedb_lib::relation::MemTable;
-use spacetimedb_lib::{Address, ReducerDef, TableDef};
+use spacetimedb_lib::{Address, ReducerDef, TableDesc};
+use spacetimedb_primitives::TableId;
+use spacetimedb_sats::relation::MemTable;
 use spacetimedb_sats::{ProductValue, Typespace, WithTypespace};
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::{Arc, Weak};
-use std::time::Duration;
-use tokio::sync::oneshot;
 
 #[derive(Debug, Default, Clone)]
 pub struct DatabaseUpdate {
@@ -40,7 +47,7 @@ impl DatabaseUpdate {
     pub fn from_writes(stdb: &RelationalDB, tx_data: &TxData) -> Self {
         let mut map: HashMap<TableId, Vec<TableOp>> = HashMap::new();
         //TODO: This should be wrapped with .auto_commit
-        let tx = stdb.begin_tx();
+        let tx = stdb.begin_mut_tx();
         for record in tx_data.records.iter() {
             let op = match record.op {
                 TxOp::Delete => 0,
@@ -63,23 +70,21 @@ impl DatabaseUpdate {
             });
         }
 
-        let mut table_name_map: HashMap<TableId, String> = HashMap::new();
+        let ctx = ExecutionContext::internal(stdb.address());
+        let mut table_name_map: HashMap<TableId, Cow<'_, str>> = HashMap::new();
         let mut table_updates = Vec::new();
         for (table_id, table_row_operations) in map.drain() {
-            let table_name = if let Some(name) = table_name_map.get(&table_id) {
-                name.clone()
-            } else {
-                let table_name = stdb.table_name_from_id(&tx, table_id.0).unwrap().unwrap();
-                table_name_map.insert(table_id, table_name.clone());
-                table_name
-            };
+            let table_name = table_name_map
+                .entry(table_id)
+                .or_insert_with(|| stdb.table_name_from_id(&ctx, &tx, table_id).unwrap().unwrap());
+            let table_name: &str = table_name.as_ref();
             table_updates.push(DatabaseTableUpdate {
-                table_id: table_id.0,
-                table_name,
+                table_id,
+                table_name: table_name.to_owned(),
                 ops: table_row_operations,
             });
         }
-        stdb.rollback_tx(tx);
+        stdb.rollback_mut_tx(&ctx, tx);
 
         DatabaseUpdate { tables: table_updates }
     }
@@ -90,7 +95,7 @@ impl DatabaseUpdate {
                 .tables
                 .into_iter()
                 .map(|table| TableUpdate {
-                    table_id: table.table_id,
+                    table_id: table.table_id.into(),
                     table_name: table.table_name,
                     table_row_operations: table
                         .ops
@@ -122,7 +127,7 @@ impl DatabaseUpdate {
                 .tables
                 .into_iter()
                 .map(|table| TableUpdateJson {
-                    table_id: table.table_id,
+                    table_id: table.table_id.into(),
                     table_name: table.table_name,
                     table_row_operations: table
                         .ops
@@ -146,14 +151,14 @@ impl DatabaseUpdate {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseTableUpdate {
-    pub table_id: u32,
+    pub table_id: TableId,
     pub table_name: String,
     pub ops: Vec<TableOp>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableOp {
     pub op_type: u8,
     pub row_pk: Vec<u8>,
@@ -189,7 +194,7 @@ pub struct ModuleEvent {
     pub caller_address: Option<Address>,
     pub function_call: ModuleFunctionCall,
     pub status: EventStatus,
-    pub energy_quanta_used: EnergyDiff,
+    pub energy_quanta_used: EnergyQuanta,
     pub host_execution_duration: Duration,
 }
 
@@ -199,10 +204,35 @@ pub struct ModuleInfo {
     pub address: Address,
     pub module_hash: Hash,
     pub typespace: Typespace,
-    pub reducers: IndexMap<String, ReducerDef>,
+    pub reducers: ReducersMap,
     pub catalog: HashMap<String, EntityDef>,
     pub log_tx: tokio::sync::broadcast::Sender<bytes::Bytes>,
     pub subscription: ModuleSubscriptionManager,
+}
+
+pub struct ReducersMap(pub IndexMap<String, ReducerDef>);
+
+impl fmt::Debug for ReducersMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::ops::Index<ReducerId> for ReducersMap {
+    type Output = ReducerDef;
+    fn index(&self, index: ReducerId) -> &Self::Output {
+        &self.0[index.0 as usize]
+    }
+}
+
+impl ReducersMap {
+    pub fn lookup_id(&self, reducer_name: &str) -> Option<ReducerId> {
+        self.0.get_index_of(reducer_name).map(ReducerId::from)
+    }
+
+    pub fn lookup(&self, reducer_name: &str) -> Option<(ReducerId, &ReducerDef)> {
+        self.0.get_full(reducer_name).map(|(id, _, def)| (id.into(), def))
+    }
 }
 
 pub trait Module: Send + Sync + 'static {
@@ -217,9 +247,8 @@ pub trait Module: Send + Sync + 'static {
         &self,
         caller_identity: Identity,
         query: String,
-    ) -> Result<Vec<spacetimedb_lib::relation::MemTable>, DBError>;
+    ) -> Result<Vec<spacetimedb_sats::relation::MemTable>, DBError>;
     fn clear_table(&self, table_name: String) -> Result<(), anyhow::Error>;
-
     #[cfg(feature = "tracelogging")]
     fn get_trace(&self) -> Option<bytes::Bytes>;
     #[cfg(feature = "tracelogging")]
@@ -238,16 +267,16 @@ pub trait ModuleInstance: Send + 'static {
 
     fn update_database(&mut self, fence: u128) -> anyhow::Result<UpdateDatabaseResult>;
 
-    fn call_reducer(
-        &mut self,
-        caller_identity: Identity,
-        caller_address: Option<Address>,
-        client: Option<ClientConnectionSender>,
-        reducer_id: usize,
-        args: ArgsTuple,
-    ) -> ReducerCallResult;
+    fn call_reducer(&mut self, params: CallReducerParams) -> ReducerCallResult;
+}
 
-    fn call_connect_disconnect(&mut self, identity: Identity, caller_address: Address, connected: bool);
+pub struct CallReducerParams {
+    pub timestamp: Timestamp,
+    pub caller_identity: Identity,
+    pub caller_address: Address,
+    pub client: Option<ClientConnectionSender>,
+    pub reducer_id: ReducerId,
+    pub args: ArgsTuple,
 }
 
 // TODO: figure out how we want to handle traps. maybe it should just not return to the LendingPool and
@@ -279,23 +308,10 @@ impl<T: Module> ModuleInstance for AutoReplacingModuleInstance<T> {
         self.check_trap();
         ret
     }
-    fn call_reducer(
-        &mut self,
-        caller_identity: Identity,
-        caller_address: Option<Address>,
-        client: Option<ClientConnectionSender>,
-        reducer_id: usize,
-        args: ArgsTuple,
-    ) -> ReducerCallResult {
-        let ret = self
-            .inst
-            .call_reducer(caller_identity, caller_address, client, reducer_id, args);
+    fn call_reducer(&mut self, params: CallReducerParams) -> ReducerCallResult {
+        let ret = self.inst.call_reducer(params);
         self.check_trap();
         ret
-    }
-    fn call_connect_disconnect(&mut self, identity: Identity, caller_address: Address, connected: bool) {
-        self.inst.call_connect_disconnect(identity, caller_address, connected);
-        self.check_trap();
     }
 }
 
@@ -316,13 +332,13 @@ impl fmt::Debug for ModuleHost {
 
 #[async_trait::async_trait]
 trait DynModuleHost: Send + Sync + 'static {
-    async fn get_instance(&self) -> Result<(&HostThreadpool, Box<dyn ModuleInstance>), NoSuchModule>;
+    async fn get_instance(&self, db: Address) -> Result<(&HostThreadpool, Box<dyn ModuleInstance>), NoSuchModule>;
     fn inject_logs(&self, log_level: LogLevel, message: &str);
     fn one_off_query(
         &self,
         caller_identity: Identity,
         query: String,
-    ) -> Result<Vec<spacetimedb_lib::relation::MemTable>, DBError>;
+    ) -> Result<Vec<spacetimedb_sats::relation::MemTable>, DBError>;
     fn clear_table(&self, table_name: String) -> Result<(), anyhow::Error>;
     fn start(&self);
     fn exit(&self) -> Closed<'_>;
@@ -362,16 +378,19 @@ async fn select_first<A: Future, B: Future<Output = ()>>(fut_a: A, fut_b: B) -> 
 
 #[async_trait::async_trait]
 impl<T: Module> DynModuleHost for HostControllerActor<T> {
-    async fn get_instance(&self) -> Result<(&HostThreadpool, Box<dyn ModuleInstance>), NoSuchModule> {
+    async fn get_instance(&self, db: Address) -> Result<(&HostThreadpool, Box<dyn ModuleInstance>), NoSuchModule> {
         self.start.notified().await;
         // in the future we should do something like in the else branch here -- add more instances based on load.
         // we need to do write-skew retries first - right now there's only ever once instance per module.
         let inst = if true {
-            self.instance_pool.request().await.map_err(|_| NoSuchModule)?
+            self.instance_pool
+                .request_with_context(db)
+                .await
+                .map_err(|_| NoSuchModule)?
         } else {
             const GET_INSTANCE_TIMEOUT: Duration = Duration::from_millis(500);
             select_first(
-                self.instance_pool.request(),
+                self.instance_pool.request_with_context(db),
                 tokio::time::sleep(GET_INSTANCE_TIMEOUT).map(|()| self.spinup_new_instance()),
             )
             .await
@@ -392,7 +411,7 @@ impl<T: Module> DynModuleHost for HostControllerActor<T> {
         &self,
         caller_identity: Identity,
         query: String,
-    ) -> Result<Vec<spacetimedb_lib::relation::MemTable>, DBError> {
+    ) -> Result<Vec<spacetimedb_sats::relation::MemTable>, DBError> {
         self.module.one_off_query(caller_identity, query)
     }
 
@@ -430,14 +449,6 @@ pub struct UpdateDatabaseSuccess {
     ///
     /// Currently always empty, as __migrate__ is not yet supported.
     pub migrate_results: Vec<ReducerCallResult>,
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum UpdateDatabaseError {
-    #[error("incompatible schema changes for: {tables:?}")]
-    IncompatibleSchema { tables: Vec<String> },
-    #[error(transparent)]
-    Database(#[from] DBError),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -492,12 +503,12 @@ impl ModuleHost {
         &self.info.subscription
     }
 
-    async fn call<F, R>(&self, f: F) -> Result<R, NoSuchModule>
+    async fn call<F, R>(&self, _reducer_name: &str, f: F) -> Result<R, NoSuchModule>
     where
         F: FnOnce(&mut dyn ModuleInstance) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let (threadpool, mut inst) = self.inner.get_instance().await?;
+        let (threadpool, mut inst) = self.inner.get_instance(self.info.address).await?;
 
         let (tx, rx) = oneshot::channel();
         threadpool.spawn(move || {
@@ -511,9 +522,24 @@ impl ModuleHost {
         caller_identity: Identity,
         caller_address: Address,
         connected: bool,
-    ) -> Result<(), NoSuchModule> {
-        self.call(move |inst| inst.call_connect_disconnect(caller_identity, caller_address, connected))
+    ) -> Result<(), ReducerCallError> {
+        match self
+            .call_reducer_inner(
+                caller_identity,
+                Some(caller_address),
+                None,
+                if connected {
+                    "__identity_connected__"
+                } else {
+                    "__identity_disconnected__"
+                },
+                ReducerArgs::Nullary,
+            )
             .await
+        {
+            Ok(_) | Err(ReducerCallError::NoSuchReducer) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     async fn call_reducer_inner(
@@ -524,17 +550,27 @@ impl ModuleHost {
         reducer_name: &str,
         args: ReducerArgs,
     ) -> Result<ReducerCallResult, ReducerCallError> {
-        let (reducer_id, _, schema) = self
+        let (reducer_id, schema) = self
             .info
             .reducers
-            .get_full(reducer_name)
+            .lookup(reducer_name)
             .ok_or(ReducerCallError::NoSuchReducer)?;
 
         let args = args.into_tuple(self.info.typespace.with_type(schema))?;
+        let caller_address = caller_address.unwrap_or(Address::__DUMMY);
 
-        self.call(move |inst| inst.call_reducer(caller_identity, caller_address, client, reducer_id, args))
-            .await
-            .map_err(Into::into)
+        self.call(reducer_name, move |inst| {
+            inst.call_reducer(CallReducerParams {
+                timestamp: Timestamp::now(),
+                caller_identity,
+                caller_address,
+                client,
+                reducer_id,
+                args,
+            })
+        })
+        .await
+        .map_err(Into::into)
     }
 
     pub async fn call_reducer(
@@ -581,13 +617,13 @@ impl ModuleHost {
             Some(schema) => args.into_tuple(schema)?,
             _ => ArgsTuple::default(),
         };
-        self.call(move |inst| inst.init_database(fence, args))
+        self.call("<init_database>", move |inst| inst.init_database(fence, args))
             .await?
             .map_err(InitDatabaseError::Other)
     }
 
     pub async fn update_database(&self, fence: u128) -> Result<UpdateDatabaseResult, anyhow::Error> {
-        self.call(move |inst| inst.update_database(fence))
+        self.call("<update_database>", move |inst| inst.update_database(fence))
             .await?
             .map_err(Into::into)
     }
@@ -642,7 +678,7 @@ impl WeakModuleHost {
 #[derive(Debug)]
 pub enum EntityDef {
     Reducer(ReducerDef),
-    Table(TableDef),
+    Table(TableDesc),
 }
 impl EntityDef {
     pub fn as_reducer(&self) -> Option<&ReducerDef> {
@@ -651,7 +687,7 @@ impl EntityDef {
             _ => None,
         }
     }
-    pub fn as_table(&self) -> Option<&TableDef> {
+    pub fn as_table(&self) -> Option<&TableDesc> {
         match self {
             Self::Table(x) => Some(x),
             _ => None,
@@ -673,7 +709,7 @@ impl Catalog {
         let schema = self.get(name)?;
         Some(schema.with(schema.ty().as_reducer()?))
     }
-    pub fn get_table(&self, name: &str) -> Option<WithTypespace<'_, TableDef>> {
+    pub fn get_table(&self, name: &str) -> Option<WithTypespace<'_, TableDesc>> {
         let schema = self.get(name)?;
         Some(schema.with(schema.ty().as_table()?))
     }

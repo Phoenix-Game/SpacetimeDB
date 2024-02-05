@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 
 use crate::config::Config;
-use crate::util::{add_auth_header_opt, database_address, get_auth_header};
+use crate::util::{add_auth_header_opt, database_address, get_auth_header_only};
 use clap::{Arg, ArgAction, ArgMatches};
 use futures::{AsyncBufReadExt, TryStreamExt};
 use is_terminal::IsTerminal;
@@ -56,8 +56,11 @@ pub enum LogLevel {
     Panic,
 }
 
+#[serde_with::serde_as]
 #[derive(serde::Deserialize)]
 struct Record<'a> {
+    #[serde_as(as = "Option<serde_with::TimestampMicroSeconds>")]
+    ts: Option<chrono::DateTime<chrono::Utc>>, // TODO: remove Option once 0.9 has been out for a while
     level: LogLevel,
     #[serde(borrow)]
     #[allow(unused)] // TODO: format this somehow
@@ -86,15 +89,12 @@ struct LogsParams {
 
 pub async fn exec(mut config: Config, args: &ArgMatches) -> Result<(), anyhow::Error> {
     let server = args.get_one::<String>("server").map(|s| s.as_ref());
+    let identity = args.get_one::<String>("identity");
     let num_lines = args.get_one::<u32>("num_lines").copied();
     let database = args.get_one::<String>("database").unwrap();
     let follow = args.get_flag("follow");
 
-    let cloned_config = config.clone();
-    let identity = cloned_config.resolve_name_to_identity(args.get_one::<String>("identity").map(|x| x.as_str()))?;
-    let auth_header = get_auth_header(&mut config, false, identity.as_deref(), server)
-        .await
-        .map(|x| x.0);
+    let auth_header = get_auth_header_only(&mut config, false, identity, server).await?;
 
     let address = database_address(&config, database, server).await?;
 
@@ -116,7 +116,7 @@ pub async fn exec(mut config: Config, args: &ArgMatches) -> Result<(), anyhow::E
     } else {
         termcolor::ColorChoice::Never
     };
-    let out = termcolor::StandardStream::stderr(term_color);
+    let out = termcolor::StandardStream::stdout(term_color);
     let mut out = out.lock();
 
     let mut rdr = res
@@ -127,6 +127,10 @@ pub async fn exec(mut config: Config, args: &ArgMatches) -> Result<(), anyhow::E
     while rdr.read_line(&mut line).await? != 0 {
         let record = serde_json::from_str::<Record<'_>>(&line)?;
 
+        if let Some(ts) = record.ts {
+            out.set_color(ColorSpec::new().set_dimmed(true))?;
+            write!(out, "{ts:?} ")?;
+        }
         let mut color = ColorSpec::new();
         let level = match record.level {
             LogLevel::Error => {

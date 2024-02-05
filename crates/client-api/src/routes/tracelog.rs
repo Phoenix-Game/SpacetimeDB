@@ -3,15 +3,15 @@ use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use http::StatusCode;
 use serde::Deserialize;
-use tempdir::TempDir;
+use tempfile::TempDir;
 
 use spacetimedb::address::Address;
 use spacetimedb::database_instance_context::DatabaseInstanceContext;
 use spacetimedb::db::Storage;
 use spacetimedb::hash::hash_bytes;
 use spacetimedb::host::instance_env::InstanceEnv;
-use spacetimedb::host::scheduler::Scheduler;
 use spacetimedb::host::tracelog::replay::replay_report;
+use spacetimedb::host::Scheduler;
 use spacetimedb_lib::Identity;
 
 use crate::{log_and_500, ControlStateReadAccess, NodeDelegate};
@@ -69,7 +69,7 @@ pub async fn stop_tracelog<S: ControlStateReadAccess + NodeDelegate>(
 pub async fn perform_tracelog_replay(body: Bytes) -> axum::response::Result<impl IntoResponse> {
     // Build out a temporary database
     let storage = Storage::Disk;
-    let tmp_dir = TempDir::new("stdb_test").expect("establish tmpdir");
+    let tmp_dir = TempDir::with_prefix("stdb_test").expect("establish tmpdir");
     let db_path = tmp_dir.path();
     let logger_path = tmp_dir.path();
     let identity = Identity::from_byte_array(hash_bytes(b"This is a fake identity.").data);
@@ -86,7 +86,7 @@ pub async fn perform_tracelog_replay(body: Bytes) -> axum::response::Result<impl
     );
     let iv = InstanceEnv::new(dbic, Scheduler::dummy(&tmp_dir.path().join("scheduler")), None);
 
-    let tx = iv.dbic.relational_db.begin_tx();
+    let tx = iv.dbic.relational_db.begin_mut_tx();
 
     let (_, resp_body) = iv.tx.set(tx, || replay_report(&iv, &mut &body[..]));
 

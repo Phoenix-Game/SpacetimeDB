@@ -1,4 +1,5 @@
 use crate::address::Address;
+use crate::error::DBError;
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{prelude::*, SeekFrom};
@@ -11,7 +12,7 @@ pub struct DatabaseLogger {
     pub tx: broadcast::Sender<bytes::Bytes>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Deserialize)]
 pub enum LogLevel {
     Error,
     Warn,
@@ -36,8 +37,11 @@ impl From<u8> for LogLevel {
 }
 
 #[serde_with::skip_serializing_none]
+#[serde_with::serde_as]
 #[derive(serde::Serialize, Copy, Clone)]
 pub struct Record<'a> {
+    #[serde_as(as = "serde_with::TimestampMicroSeconds")]
+    pub ts: chrono::DateTime<chrono::Utc>,
     pub target: Option<&'a str>,
     pub filename: Option<&'a str>,
     pub line_number: Option<u32>,
@@ -125,7 +129,7 @@ impl DatabaseLogger {
 
     pub fn filepath(address: &Address, instance_id: u64) -> PathBuf {
         let root = crate::stdb_path("worker_node/database_instances");
-        root.join(address.to_hex())
+        root.join(&*address.to_hex())
             .join(instance_id.to_string())
             .join("module_logs")
     }
@@ -142,12 +146,17 @@ impl DatabaseLogger {
         Self { file, tx }
     }
 
+    #[tracing::instrument(name = "DatabaseLogger::size", skip(self), err)]
+    pub fn size(&self) -> Result<u64, DBError> {
+        Ok(self.file.metadata()?.len())
+    }
+
     pub fn _delete(&mut self) {
         self.file.set_len(0).unwrap();
         self.file.seek(SeekFrom::End(0)).unwrap();
     }
 
-    pub fn write(&mut self, level: LogLevel, &record: &Record<'_>, bt: &dyn BacktraceProvider) {
+    pub fn write(&self, level: LogLevel, &record: &Record<'_>, bt: &dyn BacktraceProvider) {
         let (trace, frames);
         let event = match level {
             LogLevel::Error => LogEvent::Error(record),
@@ -163,7 +172,7 @@ impl DatabaseLogger {
         };
         let mut buf = serde_json::to_string(&event).unwrap();
         buf.push('\n');
-        self.file.write_all(buf.as_bytes()).unwrap();
+        (&self.file).write_all(buf.as_bytes()).unwrap();
         let _ = self.tx.send(buf.into());
     }
 
@@ -189,5 +198,44 @@ impl DatabaseLogger {
             .sum::<usize>();
 
         text[text.len() - off_from_end..].to_owned()
+    }
+
+    pub fn system_logger(&self) -> &SystemLogger {
+        // SAFETY: SystemLogger is repr(transparent) over DatabaseLogger
+        unsafe { &*(self as *const DatabaseLogger as *const SystemLogger) }
+    }
+}
+
+/// Somewhat ad-hoc wrapper around [`DatabaseLogger`] which allows to inject
+/// "system messages" into the user-retrievable database / module log
+#[repr(transparent)]
+pub struct SystemLogger {
+    inner: DatabaseLogger,
+}
+
+impl SystemLogger {
+    pub fn info(&self, msg: &str) {
+        self.inner
+            .write(crate::database_logger::LogLevel::Info, &Self::record(msg), &())
+    }
+
+    pub fn warn(&self, msg: &str) {
+        self.inner
+            .write(crate::database_logger::LogLevel::Warn, &Self::record(msg), &())
+    }
+
+    pub fn error(&self, msg: &str) {
+        self.inner
+            .write(crate::database_logger::LogLevel::Error, &Self::record(msg), &())
+    }
+
+    fn record(message: &str) -> Record {
+        Record {
+            ts: chrono::Utc::now(),
+            target: None,
+            filename: Some("spacetimedb"),
+            line_number: None,
+            message,
+        }
     }
 }

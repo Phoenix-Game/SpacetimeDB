@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 
 extern crate core;
 
+pub mod energy;
 pub mod json;
 pub mod sql;
 
@@ -17,23 +18,6 @@ where
     STDB_PATH.join(s)
 }
 
-// to let us be incremental in updating all the references to what used to be individual lazy_statics
-macro_rules! metrics_delegator {
-    ($name:ident, $field:ident: $ty:ty) => {
-        #[allow(non_camel_case_types)]
-        pub struct $name {
-            __private: (),
-        }
-        pub static $name: $name = $name { __private: () };
-        impl std::ops::Deref for $name {
-            type Target = $ty;
-            fn deref(&self) -> &$ty {
-                &METRICS.$field
-            }
-        }
-    };
-}
-
 pub mod address {
     pub use spacetimedb_lib::Address;
 }
@@ -42,17 +26,19 @@ pub mod db;
 pub mod messages;
 pub use spacetimedb_lib::Identity;
 pub mod error;
-pub mod hash;
 pub use spacetimedb_lib::identity;
+pub use spacetimedb_sats::hash;
 pub mod protobuf {
     pub use spacetimedb_client_api_messages::*;
 }
+pub mod callgrind_flag;
 pub mod client;
 pub mod config;
 pub mod control_db;
 pub mod database_instance_context;
 pub mod database_instance_context_controller;
 pub mod database_logger;
+pub mod execution_context;
 pub mod host;
 pub mod module_host_context;
 pub mod object_db;

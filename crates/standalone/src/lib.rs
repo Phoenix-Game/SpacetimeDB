@@ -12,22 +12,24 @@ use energy_monitor::StandaloneEnergyMonitor;
 use openssl::ec::{EcGroup, EcKey};
 use openssl::nid::Nid;
 use openssl::pkey::PKey;
+use scopeguard::defer_on_success;
 use spacetimedb::address::Address;
 use spacetimedb::auth::identity::{DecodingKey, EncodingKey};
 use spacetimedb::client::ClientActorIndex;
 use spacetimedb::control_db::{self, ControlDb};
 use spacetimedb::database_instance_context::DatabaseInstanceContext;
 use spacetimedb::database_instance_context_controller::DatabaseInstanceContextController;
-use spacetimedb::db::{db_metrics, Config};
-use spacetimedb::host::EnergyQuanta;
-use spacetimedb::host::UpdateDatabaseResult;
-use spacetimedb::host::UpdateOutcome;
-use spacetimedb::host::{scheduler::Scheduler, HostController};
+use spacetimedb::db::db_metrics;
+use spacetimedb::db::{db_metrics::DB_METRICS, Config};
+use spacetimedb::energy::{EnergyBalance, EnergyQuanta};
+use spacetimedb::execution_context::ExecutionContext;
+use spacetimedb::host::{HostController, Scheduler, UpdateDatabaseResult, UpdateOutcome};
 use spacetimedb::identity::Identity;
 use spacetimedb::messages::control_db::{Database, DatabaseInstance, HostType, IdentityEmail, Node};
 use spacetimedb::module_host_context::ModuleHostContext;
 use spacetimedb::object_db::ObjectDb;
 use spacetimedb::sendgrid_controller::SendGridController;
+use spacetimedb::worker_metrics::WORKER_METRICS;
 use spacetimedb::{stdb_path, worker_metrics};
 use spacetimedb_lib::name::{DomainName, InsertDomainResult, RegisterTldResult, Tld};
 use spacetimedb_lib::recovery::RecoveryCode;
@@ -45,6 +47,7 @@ pub struct StandaloneEnv {
     public_key: DecodingKey,
     private_key: EncodingKey,
     public_key_bytes: Box<[u8]>,
+    metrics_registry: prometheus::Registry,
 
     /// The following config applies to the whole environment minus the control_db and object_db.
     config: Config,
@@ -52,14 +55,19 @@ pub struct StandaloneEnv {
 
 impl StandaloneEnv {
     pub async fn init(config: Config) -> anyhow::Result<Arc<Self>> {
-        let object_db = ObjectDb::init()?;
-        let db_inst_ctx_controller = DatabaseInstanceContextController::new();
         let control_db = ControlDb::new()?;
-        let energy_monitor = Arc::new(StandaloneEnergyMonitor::new());
+        let energy_monitor = Arc::new(StandaloneEnergyMonitor::new(control_db.clone()));
+        let object_db = ObjectDb::init()?;
+        let db_inst_ctx_controller = DatabaseInstanceContextController::new(energy_monitor.clone());
         let host_controller = Arc::new(HostController::new(energy_monitor.clone()));
         let client_actor_index = ClientActorIndex::new();
         let (public_key, private_key, public_key_bytes) = get_or_create_keys()?;
-        let this = Arc::new(Self {
+
+        let metrics_registry = prometheus::Registry::new();
+        metrics_registry.register(Box::new(&*WORKER_METRICS)).unwrap();
+        metrics_registry.register(Box::new(&*DB_METRICS)).unwrap();
+
+        Ok(Arc::new(Self {
             control_db,
             db_inst_ctx_controller,
             object_db,
@@ -68,10 +76,9 @@ impl StandaloneEnv {
             public_key,
             private_key,
             public_key_bytes,
+            metrics_registry,
             config,
-        });
-        energy_monitor.set_standalone_env(this.clone());
-        Ok(this)
+        }))
     }
 }
 
@@ -154,9 +161,13 @@ fn get_key_path(env: &str) -> Option<PathBuf> {
 #[async_trait]
 impl spacetimedb_client_api::NodeDelegate for StandaloneEnv {
     fn gather_metrics(&self) -> Vec<prometheus::proto::MetricFamily> {
-        let mut metric_families = worker_metrics::REGISTRY.gather();
-        metric_families.extend(db_metrics::REGISTRY.gather());
-        metric_families
+        defer_on_success! {
+            db_metrics::reset_counters();
+            worker_metrics::reset_counters();
+        }
+        // Note, we update certain metrics such as disk usage on demand.
+        self.db_inst_ctx_controller.update_metrics();
+        self.metrics_registry.gather()
     }
 
     fn database_instance_context_controller(&self) -> &DatabaseInstanceContextController {
@@ -205,7 +216,7 @@ impl spacetimedb_client_api::ControlStateReadAccess for StandaloneEnv {
             return Ok(Some(Node {
                 id: 0,
                 unschedulable: false,
-                advertise_addr: "node:80".into(),
+                advertise_addr: Some("node:80".to_owned()),
             }));
         }
         Ok(None)
@@ -246,12 +257,16 @@ impl spacetimedb_client_api::ControlStateReadAccess for StandaloneEnv {
         self.control_db.get_identities_for_email(email)
     }
 
+    fn get_emails_for_identity(&self, identity: &Identity) -> spacetimedb::control_db::Result<Vec<IdentityEmail>> {
+        self.control_db.get_emails_for_identity(identity)
+    }
+
     fn get_recovery_codes(&self, email: &str) -> spacetimedb::control_db::Result<Vec<RecoveryCode>> {
         self.control_db.spacetime_get_recovery_codes(email)
     }
 
     // Energy
-    fn get_energy_balance(&self, identity: &Identity) -> spacetimedb::control_db::Result<Option<EnergyQuanta>> {
+    fn get_energy_balance(&self, identity: &Identity) -> spacetimedb::control_db::Result<Option<EnergyBalance>> {
         self.control_db.get_energy_balance(identity)
     }
 
@@ -291,7 +306,7 @@ impl spacetimedb_client_api::ControlStateWriteAccess for StandaloneEnv {
                 id: 0,
                 address: spec.address,
                 identity: *identity,
-                host_type: HostType::Wasmer,
+                host_type: HostType::Wasm,
                 num_replicas: spec.num_replicas,
                 program_bytes_address,
                 publisher_address,
@@ -371,20 +386,17 @@ impl spacetimedb_client_api::ControlStateWriteAccess for StandaloneEnv {
     }
 
     async fn add_energy(&self, identity: &Identity, amount: EnergyQuanta) -> spacetimedb::control_db::Result<()> {
-        let mut balance = <Self as spacetimedb_client_api::ControlStateReadAccess>::get_energy_balance(self, identity)?
-            .map(|quanta| quanta.0)
-            .unwrap_or(0);
-        balance = balance.saturating_add(amount.0);
+        let balance = self
+            .control_db
+            .get_energy_balance(identity)?
+            .unwrap_or(EnergyBalance::ZERO);
 
-        self.control_db.set_energy_balance(*identity, EnergyQuanta(balance))
+        let balance = balance.saturating_add_energy(amount);
+
+        self.control_db.set_energy_balance(*identity, balance)
     }
     async fn withdraw_energy(&self, identity: &Identity, amount: EnergyQuanta) -> spacetimedb::control_db::Result<()> {
-        let energy_balance = self.control_db.get_energy_balance(identity)?;
-        let energy_balance = energy_balance.unwrap_or(EnergyQuanta(0));
-        log::trace!("Withdrawing {} energy from {}", amount.0, identity);
-        log::trace!("Old balance: {}", energy_balance.0);
-        let new_balance = energy_balance - amount;
-        self.control_db.set_energy_balance(*identity, new_balance.as_quanta())
+        withdraw_energy(&self.control_db, identity, amount)
     }
 
     async fn register_tld(&self, identity: &Identity, tld: Tld) -> spacetimedb::control_db::Result<RegisterTldResult> {
@@ -499,17 +511,18 @@ impl StandaloneEnv {
             })?;
         let ctx = self.load_module_host_context(database.clone(), instance.id).await?;
         let stdb = &ctx.dbic.relational_db;
+        let cx = ExecutionContext::internal(stdb.address());
         let tx = stdb.begin_tx();
         match stdb.program_hash(&tx) {
             Err(e) => {
-                stdb.rollback_tx(tx);
+                stdb.release_tx(&cx, tx);
                 Err(e.into())
             }
 
             Ok(maybe_hash) => {
                 // Release tx due to locking semantics and acquire a control db
                 // lock instead.
-                stdb.commit_tx(tx)?;
+                stdb.release_tx(&cx, tx);
                 let lock = self.lock_database_instance_for_update(instance.id)?;
 
                 if let Some(hash) = maybe_hash {
@@ -551,18 +564,19 @@ impl StandaloneEnv {
 
         let ctx = self.load_module_host_context(database.clone(), instance.id).await?;
         let stdb = &ctx.dbic.relational_db;
+        let cx = ExecutionContext::internal(stdb.address());
         let tx = stdb.begin_tx();
 
         match stdb.program_hash(&tx) {
             Err(e) => {
-                stdb.rollback_tx(tx);
+                stdb.release_tx(&cx, tx);
                 Err(e.into())
             }
 
             Ok(maybe_hash) => {
                 // Release tx due to locking semantics and acquire a control db
                 // lock instead.
-                stdb.commit_tx(tx)?;
+                stdb.release_tx(&cx, tx);
                 let lock = self.lock_database_instance_for_update(instance.id)?;
 
                 match maybe_hash {
@@ -626,6 +640,7 @@ impl StandaloneEnv {
         database: Database,
         instance_id: u64,
     ) -> anyhow::Result<ModuleHostContext> {
+        let host_type = database.host_type;
         let program_bytes = self
             .object_db
             .get_object(&database.program_bytes_address)
@@ -634,30 +649,27 @@ impl StandaloneEnv {
 
         let root_db_path = stdb_path("worker_node/database_instances");
 
-        let (dbic, (scheduler, scheduler_starter)) =
-            if let Some((dbic, scheduler)) = self.db_inst_ctx_controller.get(instance_id) {
-                (dbic, scheduler.new_with_same_db())
-            } else {
-                // `spawn_blocking` because we're accessing the filesystem
-                let (dbic, (scheduler, scheduler_starter)) = tokio::task::spawn_blocking({
-                    let database = database.clone();
-                    let path = root_db_path.clone();
-                    let config = self.config;
-                    move || -> anyhow::Result<_> {
-                        let dbic = DatabaseInstanceContext::from_database(config, &database, instance_id, path);
-                        let sched = Scheduler::open(dbic.scheduler_db_path(root_db_path))?;
-                        Ok((dbic, sched))
-                    }
-                })
-                .await??;
+        let (dbic, (scheduler, scheduler_starter)) = {
+            let (dbic, scheduler) = tokio::task::block_in_place(|| {
+                self.db_inst_ctx_controller.get_or_try_init(instance_id, || {
+                    let dbic = DatabaseInstanceContext::from_database(
+                        self.config,
+                        database,
+                        instance_id,
+                        root_db_path.clone(),
+                    )?;
+                    let (sched, _) = Scheduler::open(dbic.scheduler_db_path(root_db_path))?;
 
-                self.db_inst_ctx_controller.insert(dbic.clone(), scheduler.clone());
-                (dbic, (scheduler, scheduler_starter))
-            };
+                    anyhow::Ok((dbic, sched))
+                })
+            })?;
+
+            (dbic, scheduler.new_with_same_db())
+        };
 
         let mhc = ModuleHostContext {
             dbic,
-            host_type: database.host_type,
+            host_type,
             program_bytes: program_bytes.into(),
             scheduler,
             scheduler_starter,
@@ -665,6 +677,19 @@ impl StandaloneEnv {
 
         Ok(mhc)
     }
+}
+
+fn withdraw_energy(
+    control_db: &ControlDb,
+    identity: &Identity,
+    amount: EnergyQuanta,
+) -> spacetimedb::control_db::Result<()> {
+    let energy_balance = control_db.get_energy_balance(identity)?;
+    let energy_balance = energy_balance.unwrap_or(EnergyBalance::ZERO);
+    log::trace!("Withdrawing {} from {}", amount, identity);
+    log::trace!("Old balance: {}", energy_balance);
+    let new_balance = energy_balance.saturating_sub_energy(amount);
+    control_db.set_energy_balance(*identity, new_balance)
 }
 
 pub async fn exec_subcommand(cmd: &str, args: &ArgMatches) -> Result<(), anyhow::Error> {

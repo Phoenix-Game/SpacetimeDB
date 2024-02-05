@@ -1,8 +1,8 @@
 [package]
 name = "sqltest"
-version = "0.1.0"
+version = "0.8.1"
 edition = "2021"
-description = "Sql integration test for SpaceTimeDb"
+description = "Sql integration test for SpacetimeDB"
 
 [dependencies]
 spacetimedb-lib = { path = "../lib" }
@@ -25,6 +25,6 @@ rusqlite.workspace = true
 rust_decimal.workspace = true
 sqllogictest-engines.workspace = true
 sqllogictest.workspace = true
-tempdir.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true

@@ -43,12 +43,12 @@ run_test cargo run call "$IDENT" add Julie
 run_test cargo run call "$IDENT" add Samantha
 run_test cargo run call "$IDENT" say_hello
 run_test cargo run logs "$IDENT" 100
-[ ' Hello, Samantha!' == "$(grep 'Samantha' "$TEST_OUT" | tail -n 4 | cut -d: -f4-)" ]
-[ ' Hello, Julie!' == "$(grep 'Julie' "$TEST_OUT" | tail -n 4 | cut -d: -f4-)" ]
-[ ' Hello, Robert!' == "$(grep 'Robert' "$TEST_OUT" | tail -n 4 | cut -d: -f4-)" ]
-[ ' Hello, World!' == "$(grep 'World' "$TEST_OUT" | tail -n 4 | cut -d: -f4-)" ]
+[ ' Hello, Samantha!' == "$(grep 'Samantha' "$TEST_OUT" | tail -n 4 | cut -d: -f6-)" ]
+[ ' Hello, Julie!' == "$(grep 'Julie' "$TEST_OUT" | tail -n 4 | cut -d: -f6-)" ]
+[ ' Hello, Robert!' == "$(grep 'Robert' "$TEST_OUT" | tail -n 4 | cut -d: -f6-)" ]
+[ ' Hello, World!' == "$(grep 'World' "$TEST_OUT" | tail -n 4 | cut -d: -f6-)" ]
 
-# Unchanged module is ok
+: Unchanged module is ok
 run_test cargo run publish --skip_clippy --project-path "$PROJECT_PATH" "$IDENT"
 [ "1" == "$(grep -c "Updated database" "$TEST_OUT")" ]
 
@@ -69,31 +69,7 @@ EOF
 run_test cargo run publish --skip_clippy --project-path "$PROJECT_PATH" "$IDENT" || true
 [ "1" == "$(grep -c "Error: Database update rejected" "$TEST_OUT")" ]
 
-# Adding an index is fine, too, and invokes update
-cat > "${PROJECT_PATH}/src/lib.rs" <<EOF
-use spacetimedb::{println, spacetimedb};
-
-#[spacetimedb(table)]
-#[spacetimedb(index(btree, name = "name", name))]
-pub struct Person {
-    #[primarykey]
-    #[autoinc]
-    id: u64,
-    name: String,
-}
-
-#[spacetimedb(update)]
-pub fn on_module_update() {
-    println!("INDEX ADDED");
-}
-EOF
-
-run_test cargo run publish --skip_clippy --project-path "$PROJECT_PATH" "$IDENT"
-[ "1" == "$(grep -c "Updated database" "$TEST_OUT")" ]
-run_test cargo run logs "$IDENT" 2
-[ ' INDEX ADDED' == "$(grep 'INDEX ADDED' "$TEST_OUT" | tail -n 1 | cut -d: -f4-)" ]
-
-# Adding a table is ok, and invokes update
+: Adding a table is ok, and invokes update
 cat > "${PROJECT_PATH}/src/lib.rs" <<EOF
 use spacetimedb::{println, spacetimedb};
 
@@ -119,4 +95,4 @@ EOF
 run_test cargo run publish --skip_clippy --project-path "$PROJECT_PATH" "$IDENT"
 [ "1" == "$(grep -c "Updated database" "$TEST_OUT")" ]
 run_test cargo run logs "$IDENT" 2
-[ ' MODULE UPDATED' == "$(grep 'MODULE UPDATED' "$TEST_OUT" | tail -n 1 | cut -d: -f4-)" ]
+[ ' MODULE UPDATED' == "$(grep 'MODULE UPDATED' "$TEST_OUT" | tail -n 1 | cut -d: -f6-)" ]

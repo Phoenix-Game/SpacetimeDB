@@ -16,6 +16,8 @@ use spacetimedb::protobuf::client_api;
 use spacetimedb_client_api::{ControlStateReadAccess, ControlStateWriteAccess, DatabaseDef, NodeDelegate};
 use spacetimedb_lib::sats;
 
+pub use spacetimedb::database_logger::LogLevel;
+
 use spacetimedb_standalone::StandaloneEnv;
 
 pub fn start_runtime() -> Runtime {
@@ -77,9 +79,15 @@ pub struct CompiledModule {
     program_bytes: OnceLock<Vec<u8>>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum CompilationMode {
+    Debug,
+    Release,
+}
+
 impl CompiledModule {
-    pub fn compile(name: &str) -> Self {
-        let path = spacetimedb_cli::build(&module_path(name), false, true).unwrap();
+    pub fn compile(name: &str, mode: CompilationMode) -> Self {
+        let path = spacetimedb_cli::build(&module_path(name), false, mode == CompilationMode::Debug).unwrap();
         Self {
             name: name.to_owned(),
             path,
@@ -98,7 +106,7 @@ impl CompiledModule {
     {
         with_runtime(move |runtime| {
             runtime.block_on(async {
-                let module = self.load_module(config).await;
+                let module = self.load_module(config, None).await;
 
                 routine(module).await;
             });
@@ -110,17 +118,28 @@ impl CompiledModule {
         F: FnOnce(&Runtime, &ModuleHandle),
     {
         with_runtime(move |runtime| {
-            let module = runtime.block_on(async { self.load_module(config).await });
+            let module = runtime.block_on(async { self.load_module(config, None).await });
 
             func(runtime, &module);
         });
     }
 
-    pub async fn load_module(&self, config: Config) -> ModuleHandle {
-        let paths = FilesLocal::temp(&self.name);
-        // The database created in the `temp` folder can't be randomized,
-        // so it persists after running the test.
-        std::fs::remove_dir(paths.db_path()).ok();
+    /// Load a module with the given config.
+    /// If "reuse_db_path" is set, the module will be loaded in the given path,
+    /// without resetting the database.
+    /// This is used to speed up benchmarks running under callgrind (it allows them to reuse native-compiled wasm modules).
+    pub async fn load_module(&self, config: Config, reuse_db_path: Option<&Path>) -> ModuleHandle {
+        let paths = match reuse_db_path {
+            Some(path) => FilesLocal::hidden(path),
+            None => {
+                let paths = FilesLocal::temp(&self.name);
+
+                // The database created in the `temp` folder can't be randomized,
+                // so it persists after running the test.
+                std::fs::remove_dir(paths.db_path()).ok();
+                paths
+            }
+        };
 
         crate::set_key_env_vars(&paths);
         let env = spacetimedb_standalone::StandaloneEnv::init(config).await.unwrap();
@@ -174,3 +193,17 @@ pub static DEFAULT_CONFIG: Config = Config {
     storage: Storage::Disk,
     fsync: FsyncPolicy::Never,
 };
+
+/// Used to parse output from module logs.
+///
+/// Sync with: `core::database_logger::Record`. We can't use it
+/// directly because the types are wrong for deserialization.
+/// (Rust!)
+#[derive(serde::Deserialize)]
+pub struct LoggerRecord {
+    pub level: LogLevel,
+    pub target: Option<String>,
+    pub filename: Option<String>,
+    pub line_number: Option<u32>,
+    pub message: String,
+}

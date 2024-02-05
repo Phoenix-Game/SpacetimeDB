@@ -28,9 +28,11 @@ pub fn get_subcommands() -> Vec<Command> {
         dns::cli(),
         generate::cli(),
         list::cli(),
+        local::cli(),
         init::cli(),
         build::cli(),
         server::cli(),
+        upgrade::cli(),
         #[cfg(feature = "standalone")]
         start::cli(ProgramMode::CLI),
     ]
@@ -50,11 +52,13 @@ pub async fn exec_subcommand(config: Config, cmd: &str, args: &ArgMatches) -> Re
         "dns" => dns::exec(config, args).await,
         "generate" => generate::exec(args),
         "list" => list::exec(config, args).await,
+        "local" => local::exec(config, args).await,
         "init" => init::exec(config, args).await,
         "build" => build::exec(config, args).await,
         "server" => server::exec(config, args).await,
         #[cfg(feature = "standalone")]
         "start" => start::exec(args).await,
+        "upgrade" => upgrade::exec(args).await,
         unknown => Err(anyhow::anyhow!("Invalid subcommand: {}", unknown)),
     }
 }

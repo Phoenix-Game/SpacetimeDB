@@ -1,10 +1,11 @@
 use std::time::Duration;
 
+use crate::energy::EnergyQuanta;
 use crate::host::module_host::{EventStatus, ModuleEvent, ModuleFunctionCall};
-use crate::host::{EnergyDiff, ReducerArgs, Timestamp};
+use crate::host::{ReducerArgs, Timestamp};
 use crate::identity::Identity;
 use crate::protobuf::client_api::{message, FunctionCall, Message, Subscribe};
-use crate::worker_metrics::{WEBSOCKET_REQUESTS, WEBSOCKET_REQUEST_MSG_SIZE};
+use crate::worker_metrics::WORKER_METRICS;
 use base64::Engine;
 use bytes::Bytes;
 use bytestring::ByteString;
@@ -35,12 +36,14 @@ pub async fn handle(client: &ClientConnection, message: DataMessage) -> Result<(
         DataMessage::Binary(_) => "binary",
     };
 
-    WEBSOCKET_REQUEST_MSG_SIZE
-        .with_label_values(&[format!("{}", client.database_instance_id).as_str(), message_kind])
+    WORKER_METRICS
+        .websocket_request_msg_size
+        .with_label_values(&client.database_instance_id, message_kind)
         .observe(message.len() as f64);
 
-    WEBSOCKET_REQUESTS
-        .with_label_values(&[format!("{}", client.database_instance_id).as_str(), message_kind])
+    WORKER_METRICS
+        .websocket_requests
+        .with_label_values(&client.database_instance_id, message_kind)
         .inc();
 
     match message {
@@ -176,7 +179,7 @@ impl MessageExecutionError {
                 args: Default::default(),
             },
             status: EventStatus::Failed(format!("{:#}", self.err)),
-            energy_quanta_used: EnergyDiff::ZERO,
+            energy_quanta_used: EnergyQuanta::ZERO,
             host_execution_duration: Duration::ZERO,
         }
     }

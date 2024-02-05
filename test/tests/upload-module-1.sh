@@ -31,7 +31,7 @@ pub fn say_hello() {
 }
 EOF
 
-run_test cargo run publish -S -d --project-path "$PROJECT_PATH" --clear-database
+run_test cargo run publish --skip_clippy --project-path "$PROJECT_PATH" --clear-database
 [ "1" == "$(grep -c "reated new database" "$TEST_OUT")" ]
 IDENT="$(grep "reated new database" "$TEST_OUT" | awk 'NF>1{print $NF}')"
 
@@ -40,7 +40,7 @@ run_test cargo run call "$IDENT" add Julie
 run_test cargo run call "$IDENT" add Samantha
 run_test cargo run call "$IDENT" say_hello
 run_test cargo run logs "$IDENT" 100
-[ ' Hello, Samantha!' == "$(grep 'Samantha' "$TEST_OUT" | tail -n 4 | cut -d: -f4-)" ]
-[ ' Hello, Julie!' == "$(grep 'Julie' "$TEST_OUT" | tail -n 4 | cut -d: -f4-)" ]
-[ ' Hello, Robert!' == "$(grep 'Robert' "$TEST_OUT" | tail -n 4 | cut -d: -f4-)" ]
-[ ' Hello, World!' == "$(grep 'World' "$TEST_OUT" | tail -n 4 | cut -d: -f4-)" ]
+[ ' Hello, Samantha!' == "$(grep 'Samantha' "$TEST_OUT" | tail -n 4 | cut -d: -f6-)" ]
+[ ' Hello, Julie!' == "$(grep 'Julie' "$TEST_OUT" | tail -n 4 | cut -d: -f6-)" ]
+[ ' Hello, Robert!' == "$(grep 'Robert' "$TEST_OUT" | tail -n 4 | cut -d: -f6-)" ]
+[ ' Hello, World!' == "$(grep 'World' "$TEST_OUT" | tail -n 4 | cut -d: -f6-)" ]

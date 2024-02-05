@@ -4,11 +4,12 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use spacetimedb::auth::identity::encode_token_with_expiry;
+use spacetimedb::messages::control_db::IdentityEmail;
 use spacetimedb_lib::de::serde::DeserializeWrapper;
-use spacetimedb_lib::Identity;
+use spacetimedb_lib::{Address, Identity};
 
 use crate::auth::{SpacetimeAuth, SpacetimeAuthHeader};
-use crate::{log_and_500, ControlStateDelegate, ControlStateWriteAccess, NodeDelegate};
+use crate::{log_and_500, ControlStateDelegate, ControlStateReadAccess, ControlStateWriteAccess, NodeDelegate};
 
 #[derive(Deserialize)]
 pub struct CreateIdentityQueryParams {
@@ -17,7 +18,7 @@ pub struct CreateIdentityQueryParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateIdentityResponse {
-    identity: String,
+    identity: Identity,
     token: String,
 }
 
@@ -33,7 +34,7 @@ pub async fn create_identity<S: ControlStateDelegate + NodeDelegate>(
     }
 
     let identity_response = CreateIdentityResponse {
-        identity: auth.identity.to_hex(),
+        identity: auth.identity,
         token: auth.creds.token().to_owned(),
     };
     Ok(axum::Json(identity_response))
@@ -46,7 +47,7 @@ pub struct GetIdentityResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GetIdentityResponseEntry {
-    identity: String,
+    identity: Identity,
     email: String,
 }
 
@@ -71,7 +72,7 @@ pub async fn get_identity<S: ControlStateDelegate>(
 
                 for identity_email in identities {
                     response.identities.push(GetIdentityResponseEntry {
-                        identity: identity_email.identity.to_hex(),
+                        identity: identity_email.identity,
                         email: identity_email.email,
                     })
                 }
@@ -130,6 +131,28 @@ pub async fn set_email<S: ControlStateWriteAccess>(
     Ok(())
 }
 
+pub async fn check_email<S: ControlStateReadAccess>(
+    State(ctx): State<S>,
+    Path(SetEmailParams { identity }): Path<SetEmailParams>,
+    auth: SpacetimeAuthHeader,
+) -> axum::response::Result<impl IntoResponse> {
+    let identity = identity.into();
+    let auth = auth.get().ok_or(StatusCode::BAD_REQUEST)?;
+
+    if auth.identity != identity {
+        return Err(StatusCode::UNAUTHORIZED.into());
+    }
+
+    let emails = ctx
+        .get_emails_for_identity(&identity)
+        .map_err(log_and_500)?
+        .into_iter()
+        .map(|IdentityEmail { email, .. }| email)
+        .collect::<Vec<_>>();
+
+    Ok(axum::Json(emails))
+}
+
 #[derive(Deserialize)]
 pub struct GetDatabasesParams {
     identity: IdentityForUrl,
@@ -137,7 +160,7 @@ pub struct GetDatabasesParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetDatabasesResponse {
-    addresses: Vec<String>,
+    addresses: Vec<Address>,
 }
 
 pub async fn get_databases<S: ControlStateDelegate>(
@@ -150,12 +173,12 @@ pub async fn get_databases<S: ControlStateDelegate>(
         log::error!("Failure when retrieving databases for search: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let matching_dbs = all_dbs.into_iter().filter(|db| db.identity == identity);
-    let addresses = matching_dbs.map(|db| db.address.to_hex());
-    let response = GetDatabasesResponse {
-        addresses: addresses.collect(),
-    };
-    Ok(axum::Json(response))
+    let addresses = all_dbs
+        .iter()
+        .filter(|db| db.identity == identity)
+        .map(|db| db.address)
+        .collect();
+    Ok(axum::Json(GetDatabasesResponse { addresses }))
 }
 
 #[derive(Debug, Serialize)]
@@ -216,5 +239,6 @@ where
         .route("/websocket_token", post(create_websocket_token::<S>))
         .route("/:identity/verify", get(validate_token))
         .route("/:identity/set-email", post(set_email::<S>))
+        .route("/:identity/emails", get(check_email::<S>))
         .route("/:identity/databases", get(get_databases::<S>))
 }

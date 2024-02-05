@@ -66,6 +66,11 @@ impl ObjectDB for RocksDBObjectDB {
     fn sync_all(&mut self) -> Result<(), DBError> {
         self.flush()
     }
+
+    fn size_on_disk(&self) -> Result<u64, DBError> {
+        // TODO: Compute the size of the rocksdb instance
+        Ok(0)
+    }
 }
 
 #[cfg(test)]
@@ -75,14 +80,14 @@ mod tests {
     use crate::error::DBError;
     use crate::hash::hash_bytes;
     use spacetimedb_lib::error::ResultTest;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     const TEST_DB_DIR_PREFIX: &str = "rocksdb_test";
     const TEST_DATA1: &[u8; 21] = b"this is a byte string";
     const TEST_DATA2: &[u8; 26] = b"this is also a byte string";
 
     fn setup() -> Result<RocksDBObjectDB, DBError> {
-        let tmp_dir = TempDir::new(TEST_DB_DIR_PREFIX).unwrap();
+        let tmp_dir = TempDir::with_prefix(TEST_DB_DIR_PREFIX).unwrap();
         RocksDBObjectDB::open(tmp_dir.path())
     }
 

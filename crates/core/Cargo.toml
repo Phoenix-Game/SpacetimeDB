@@ -1,6 +1,6 @@
 [package]
 name = "spacetimedb-core"
-version = "0.6.1"
+version = "0.8.1"
 edition = "2021"
 license-file = "LICENSE"
 description = "The core library for SpacetimeDB"
@@ -18,10 +18,13 @@ name = "odb_flavor_bench"
 harness = false
 
 [dependencies]
-spacetimedb-lib = { path = "../lib", version = "0.6.1" }
-spacetimedb-sats = { path = "../sats", version = "0.6.1" }
-spacetimedb-vm = { path = "../vm", version = "0.6.1" }
-spacetimedb-client-api-messages = { path = "../client-api-messages", version = "0.6.1" }
+spacetimedb-lib = { path = "../lib", version = "0.8.1" }
+spacetimedb-client-api-messages = { path = "../client-api-messages", version = "0.8.1" }
+spacetimedb-metrics = { path = "../metrics", version = "0.8.1" }
+spacetimedb-primitives = { path = "../primitives", version = "0.8.1" }
+spacetimedb-sats = { path = "../sats", version = "0.8.1" }
+spacetimedb-table = { path = "../table", version = "0.8.1" }
+spacetimedb-vm = { path = "../vm", version = "0.8.1" }
 
 anyhow.workspace = true
 async-trait.workspace = true
@@ -29,15 +32,16 @@ backtrace.workspace = true
 base64.workspace = true
 bytes.workspace = true
 bytestring.workspace = true
+chrono.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
 derive_more.workspace = true
 dirs.workspace = true
 email_address.workspace = true
+enum-map.workspace = true
 flate2.workspace = true
 fs2.workspace = true
 futures.workspace = true
-genawaiter.workspace = true
 hex.workspace = true
 hostname.workspace = true
 hyper.workspace = true
@@ -47,13 +51,14 @@ itertools.workspace = true
 jsonwebtoken.workspace = true
 lazy_static.workspace = true
 log.workspace = true
-nonempty.workspace = true
 once_cell.workspace = true
 openssl.workspace = true
 parking_lot.workspace = true
+paste.workspace = true
 pin-project-lite.workspace = true
 prometheus.workspace = true
 prost.workspace = true
+rayon.workspace = true
 rayon-core.workspace = true
 regex.workspace = true
 rustc-demangle.workspace = true
@@ -63,16 +68,19 @@ sendgrid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
-serde_with.workspace = true
+serde_with = { workspace = true, features = ["chrono_0_4"] }
 sha1.workspace = true
 slab.workspace = true
 sled.workspace = true
+smallvec.workspace = true
 sqlparser.workspace = true
 strum.workspace = true
-tempdir.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true
+tokio-stream = "0.1"
+toml.workspace = true
 tracing-appender.workspace = true
 tracing-core.workspace = true
 tracing-flame.workspace = true
@@ -83,23 +91,27 @@ tracing.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 uuid.workspace = true
-wasmer-middlewares.workspace = true
-wasmer-types.workspace = true
-wasmer-vm.workspace = true
-wasmer.workspace = true
-wasmparser.workspace = true
+wasmtime.workspace = true
 # Rocksdb ostorage backend, linked only if "rocksdb" feature enabled.
 rocksdb = {workspace = true, optional = true}
 
 [features]
+# Enable metrics in spacetimedb.
+metrics = []
 # Optional storage engines.
 odb_rocksdb = ["dep:rocksdb"]
 odb_sled = []
-default = ["odb_sled"]
+default = ["odb_sled", "metrics"]
 
 [dev-dependencies]
+spacetimedb-lib = { path = "../lib", features = ["proptest"] }
+spacetimedb-sats = { path = "../sats", features = ["proptest"] }
+
 rusqlite.workspace = true
 criterion.workspace = true
+# Also as dev-dependencies for use in _this_ crate's tests.
+proptest.workspace = true
+proptest-derive.workspace = true
 rand.workspace = true
 
 [build-dependencies]

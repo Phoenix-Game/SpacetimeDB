@@ -1,6 +1,11 @@
+use std::path::Path;
+
 use spacetimedb::db::{Config, FsyncPolicy, Storage};
-use spacetimedb_lib::{sats::ArrayValue, AlgebraicValue, ProductValue};
-use spacetimedb_testing::modules::{start_runtime, CompiledModule, ModuleHandle};
+use spacetimedb_lib::{
+    sats::{product, ArrayValue},
+    AlgebraicValue, ProductValue,
+};
+use spacetimedb_testing::modules::{start_runtime, CompilationMode, CompiledModule, LoggerRecord, ModuleHandle};
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -10,8 +15,16 @@ use crate::{
 };
 
 lazy_static::lazy_static! {
-    pub static ref BENCHMARKS_MODULE: CompiledModule =
-        CompiledModule::compile("benchmarks");
+    pub static ref BENCHMARKS_MODULE: CompiledModule = {
+        // Temporarily add CARGO_TARGET_DIR override to avoid conflicts with main target dir.
+        // Otherwise for some reason Cargo will mark all dependencies with build scripts as
+        // fresh - but only if running benchmarks (if modules are built in release mode).
+        // See https://github.com/clockworklabs/SpacetimeDB/issues/401.
+        std::env::set_var("CARGO_TARGET_DIR", concat!(env!("CARGO_MANIFEST_DIR"), "/target"));
+        let module = CompiledModule::compile("benchmarks", CompilationMode::Release);
+        std::env::remove_var("CARGO_TARGET_DIR");
+        module
+    };
 }
 
 /// A benchmark backend that invokes a spacetime module.
@@ -60,7 +73,14 @@ impl BenchDatabase for SpacetimeModule {
             },
             storage: if in_memory { Storage::Memory } else { Storage::Disk },
         };
-        let module = runtime.block_on(async { BENCHMARKS_MODULE.load_module(config).await });
+
+        let module = runtime.block_on(async {
+            // We keep a saved database at "crates/bench/.spacetime".
+            // This is mainly used for caching wasmtime native artifacts.
+            BENCHMARKS_MODULE
+                .load_module(config, Some(Path::new(env!("CARGO_MANIFEST_DIR"))))
+                .await
+        });
 
         for thing in module.client.module.catalog().iter() {
             log::trace!("SPACETIME_MODULE: LOADED: {} {:?}", thing.0, thing.1.ty());
@@ -143,11 +163,8 @@ impl BenchDatabase for SpacetimeModule {
     }
 
     fn insert_bulk<T: BenchTable>(&mut self, table_id: &Self::TableId, rows: Vec<T>) -> ResultBench<()> {
-        let args = ProductValue {
-            elements: vec![AlgebraicValue::Builtin(spacetimedb_lib::sats::BuiltinValue::Array {
-                val: ArrayValue::Product(rows.into_iter().map(|row| row.into_product_value()).collect()),
-            })],
-        };
+        let rows = rows.into_iter().map(|row| row.into_product_value()).collect();
+        let args = product![ArrayValue::Product(rows)];
         let SpacetimeModule { runtime, module } = self;
         let module = module.as_mut().unwrap();
         let reducer_name = format!("insert_bulk_{}", table_id.snake_case);
@@ -193,22 +210,8 @@ impl BenchDatabase for SpacetimeModule {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct TableId {
     pascal_case: String,
     snake_case: String,
-}
-
-#[allow(unused)]
-/// Used to parse output from module logs.
-///
-/// Sync with: `core::database_logger::Record`. We can't use it
-/// directly because the types are wrong for deserialization.
-/// (Rust!)
-#[derive(serde::Deserialize)]
-struct LoggerRecord {
-    target: Option<String>,
-    filename: Option<String>,
-    line_number: Option<u32>,
-    message: String,
 }

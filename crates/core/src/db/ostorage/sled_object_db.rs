@@ -17,7 +17,6 @@ impl SledObjectDB {
             .flush_every_ms(Some(50))
             .mode(HighThroughput);
         let db = config.open()?;
-
         Ok(Self { db })
     }
 }
@@ -48,6 +47,10 @@ impl ObjectDB for SledObjectDB {
     fn sync_all(&mut self) -> Result<(), DBError> {
         self.flush()
     }
+
+    fn size_on_disk(&self) -> Result<u64, DBError> {
+        Ok(self.db.size_on_disk()?)
+    }
 }
 
 #[cfg(test)]
@@ -57,14 +60,14 @@ mod tests {
 
     use crate::error::DBError;
     use crate::hash::hash_bytes;
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     const TEST_DB_DIR_PREFIX: &str = "sledb_test";
     const TEST_DATA1: &[u8; 21] = b"this is a byte string";
     const TEST_DATA2: &[u8; 26] = b"this is also a byte string";
 
     fn setup() -> Result<SledObjectDB, DBError> {
-        let tmp_dir = TempDir::new(TEST_DB_DIR_PREFIX).unwrap();
+        let tmp_dir = TempDir::with_prefix(TEST_DB_DIR_PREFIX).unwrap();
         SledObjectDB::open(tmp_dir.path())
     }
 

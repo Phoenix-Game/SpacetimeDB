@@ -3,12 +3,17 @@ use criterion::{
     measurement::{Measurement, WallTime},
     Bencher, BenchmarkGroup, Criterion,
 };
+use mimalloc::MiMalloc;
 use spacetimedb_bench::{
     database::BenchDatabase,
     schemas::{create_sequential, BenchTable, IndexStrategy, Location, Person, RandomTable, BENCH_PKEY_INDEX},
     spacetime_module, spacetime_raw, sqlite, ResultBench,
 };
-use spacetimedb_lib::{sats::BuiltinType, AlgebraicType};
+use spacetimedb_lib::sats::AlgebraicType;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn criterion_benchmark(c: &mut Criterion) {
     bench_suite::<sqlite::SQLite>(c, true).unwrap();
     bench_suite::<spacetime_raw::SpacetimeRaw>(c, true).unwrap();
@@ -122,7 +127,7 @@ fn bench_harness<
 
 #[inline(never)]
 fn empty<DB: BenchDatabase>(g: &mut Group, db: &mut DB) -> ResultBench<()> {
-    let id = format!("empty");
+    let id = "empty".to_string();
     g.bench_function(&id, |b| {
         bench_harness(
             b,
@@ -159,11 +164,11 @@ fn insert_1<DB: BenchDatabase, T: BenchTable + RandomTable>(
                 let mut data = data.clone();
                 db.clear_table(table_id)?;
                 let row = data.pop().unwrap();
-                db.insert_bulk(&table_id, data)?;
+                db.insert_bulk(table_id, data)?;
                 Ok(row)
             },
             |db, row| {
-                db.insert(&table_id, row)?;
+                db.insert(table_id, row)?;
                 Ok(())
             },
         )
@@ -196,12 +201,12 @@ fn insert_bulk<DB: BenchDatabase, T: BenchTable + RandomTable>(
                 db.clear_table(table_id)?;
                 let to_insert = data.split_off(load as usize);
                 if !data.is_empty() {
-                    db.insert_bulk(&table_id, data)?;
+                    db.insert_bulk(table_id, data)?;
                 }
                 Ok(to_insert)
             },
             |db, to_insert| {
-                db.insert_bulk(&table_id, to_insert)?;
+                db.insert_bulk(table_id, to_insert)?;
                 Ok(())
             },
         )
@@ -242,7 +247,6 @@ fn iterate<DB: BenchDatabase, T: BenchTable + RandomTable>(
     Ok(())
 }
 
-/// Implements both "filter" and "find" benchmarks.
 #[inline(never)]
 fn filter<DB: BenchDatabase, T: BenchTable + RandomTable>(
     g: &mut Group,
@@ -253,10 +257,10 @@ fn filter<DB: BenchDatabase, T: BenchTable + RandomTable>(
     load: u32,
     buckets: u32,
 ) -> ResultBench<()> {
-    let filter_column_type = match &T::product_type().elements[column_index as usize].algebraic_type {
-        AlgebraicType::Builtin(BuiltinType::String) => "string",
-        AlgebraicType::Builtin(BuiltinType::U32) => "u32",
-        AlgebraicType::Builtin(BuiltinType::U64) => "u64",
+    let filter_column_type = match T::product_type().elements[column_index as usize].algebraic_type {
+        AlgebraicType::String => "string",
+        AlgebraicType::U32 => "u32",
+        AlgebraicType::U64 => "u64",
         _ => unimplemented!(),
     };
     let mean_result_count = load / buckets;
@@ -269,7 +273,7 @@ fn filter<DB: BenchDatabase, T: BenchTable + RandomTable>(
 
     let data = create_sequential::<T>(0xdeadbeef, load, buckets as u64);
 
-    db.insert_bulk(&table_id, data.clone())?;
+    db.insert_bulk(table_id, data.clone())?;
 
     // Each iteration performs a single transaction.
     g.throughput(criterion::Throughput::Elements(1));
@@ -290,7 +294,7 @@ fn filter<DB: BenchDatabase, T: BenchTable + RandomTable>(
                 Ok(value)
             },
             |db, value| {
-                db.filter::<T>(&table_id, column_index, value)?;
+                db.filter::<T>(table_id, column_index, value)?;
                 Ok(())
             },
         )
@@ -299,7 +303,6 @@ fn filter<DB: BenchDatabase, T: BenchTable + RandomTable>(
     Ok(())
 }
 
-/// Implements both "filter" and "find" benchmarks.
 #[inline(never)]
 fn find<DB: BenchDatabase, T: BenchTable + RandomTable>(
     g: &mut Group,
@@ -319,7 +322,7 @@ fn find<DB: BenchDatabase, T: BenchTable + RandomTable>(
 
     let data = create_sequential::<T>(0xdeadbeef, load, buckets as u64);
 
-    db.insert_bulk(&table_id, data.clone())?;
+    db.insert_bulk(table_id, data.clone())?;
 
     // Each iteration performs a single transaction.
     g.throughput(criterion::Throughput::Elements(1));
@@ -339,7 +342,7 @@ fn find<DB: BenchDatabase, T: BenchTable + RandomTable>(
                 Ok(value)
             },
             |db, value| {
-                db.filter::<T>(&table_id, column_id, value)?;
+                db.filter::<T>(table_id, column_id, value)?;
                 Ok(())
             },
         )

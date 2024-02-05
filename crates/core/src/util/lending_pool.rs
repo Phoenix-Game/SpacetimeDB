@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use parking_lot::Mutex;
+use spacetimedb_lib::Address;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::worker_metrics::{MAX_QUEUE_LEN, WORKER_METRICS};
 
 use super::notify_once::{NotifiedOnce, NotifyOnce};
 
@@ -18,18 +21,18 @@ pub struct LendingPool<T> {
     inner: Arc<LendingPoolInner<T>>,
 }
 
+impl<T> Default for LendingPool<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> Clone for LendingPool<T> {
     fn clone(&self) -> Self {
         Self {
             sem: self.sem.clone(),
             inner: self.inner.clone(),
         }
-    }
-}
-
-impl<T> Default for LendingPool<T> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -51,11 +54,36 @@ impl<T> LendingPool<T> {
         Self::from_iter(std::iter::empty())
     }
 
-    pub fn request(&self) -> impl Future<Output = Result<LentResource<T>, PoolClosed>> {
+    pub fn request_with_context(&self, db: Address) -> impl Future<Output = Result<LentResource<T>, PoolClosed>> {
         let acq = self.sem.clone().acquire_owned();
         let pool_inner = self.inner.clone();
+
+        let queue_len = WORKER_METRICS.instance_queue_length.with_label_values(&db);
+        let queue_len_max = WORKER_METRICS.instance_queue_length_max.with_label_values(&db);
+        let queue_len_histogram = WORKER_METRICS.instance_queue_length_histogram.with_label_values(&db);
+
+        queue_len.inc();
+        let new_queue_len = queue_len.get();
+        queue_len_histogram.observe(new_queue_len as f64);
+
+        let mut guard = MAX_QUEUE_LEN.lock().unwrap();
+        let max_queue_len = *guard
+            .entry(db)
+            .and_modify(|max| {
+                if new_queue_len > *max {
+                    *max = new_queue_len;
+                }
+            })
+            .or_insert_with(|| new_queue_len);
+
+        drop(guard);
+        queue_len_max.set(max_queue_len);
+
         async move {
-            let permit = acq.await.map_err(|_| PoolClosed)?;
+            let permit_result = acq.await.map_err(|_| PoolClosed);
+            queue_len.dec();
+            queue_len_histogram.observe(queue_len.get() as f64);
+            let permit = permit_result?;
             let resource = pool_inner
                 .vec
                 .lock()
@@ -163,17 +191,6 @@ impl<T> DerefMut for LentResource<T> {
         &mut self.resource
     }
 }
-
-// impl<T> LentResource<T> {
-//     fn keep(this: Self) -> T {
-//         let mut this = ManuallyDrop::new(this);
-//         let resource = unsafe { ManuallyDrop::take(&mut this.resource) };
-//         let permit = unsafe { ManuallyDrop::take(&mut this.permit) };
-//         permit.forget();
-//         let prev_count = this.pool.total_count.fetch_sub(1, SeqCst);
-//         resource
-//     }
-// }
 
 impl<T> Drop for LentResource<T> {
     fn drop(&mut self) {

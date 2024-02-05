@@ -1,19 +1,17 @@
 use std::fmt::Write;
 use std::time::Duration;
 
-use axum::extract::rejection::{TypedHeaderRejection, TypedHeaderRejectionReason};
 use axum::extract::Query;
-use axum::headers::authorization::Credentials;
-use axum::headers::{self, authorization};
 use axum::response::IntoResponse;
-use axum::TypedHeader;
+use axum_extra::typed_header::{TypedHeader, TypedHeaderRejection, TypedHeaderRejectionReason};
 use bytes::BytesMut;
+use headers::authorization::{self, Credentials};
 use http::{request, HeaderValue, StatusCode};
 use serde::Deserialize;
 use spacetimedb::auth::identity::{
     decode_token, encode_token, DecodingKey, EncodingKey, JwtError, JwtErrorKind, SpacetimeIdentityClaims,
 };
-use spacetimedb::host::EnergyDiff;
+use spacetimedb::energy::EnergyQuanta;
 use spacetimedb::identity::Identity;
 
 use crate::{log_and_500, ControlStateDelegate, NodeDelegate};
@@ -79,10 +77,10 @@ impl<S: NodeDelegate + Send + Sync> axum::extract::FromRequestParts<S> for Space
     type Rejection = AuthorizationRejection;
     async fn from_request_parts(parts: &mut request::Parts, state: &S) -> Result<Self, Self::Rejection> {
         match (
-            axum::TypedHeader::from_request_parts(parts, state).await,
+            TypedHeader::from_request_parts(parts, state).await,
             Query::<TokenQueryParam>::from_request_parts(parts, state).await,
         ) {
-            (Ok(axum::TypedHeader(headers::Authorization(creds @ SpacetimeCreds { .. }))), _) => {
+            (Ok(TypedHeader(headers::Authorization(creds @ SpacetimeCreds { .. }))), _) => {
                 let claims = creds
                     .decode_token(state.public_key())
                     .map_err(|e| AuthorizationRejection {
@@ -90,9 +88,7 @@ impl<S: NodeDelegate + Send + Sync> axum::extract::FromRequestParts<S> for Space
                     })?;
                 let auth = SpacetimeAuth {
                     creds,
-                    identity: Identity::from_hex(claims.hex_identity).map_err(|_| AuthorizationRejection {
-                        reason: AuthorizationRejectionReason::CantDecodeAuthorizationToken,
-                    })?,
+                    identity: claims.identity,
                 };
                 Ok(Self { auth: Some(auth) })
             }
@@ -111,9 +107,7 @@ impl<S: NodeDelegate + Send + Sync> axum::extract::FromRequestParts<S> for Space
                     })?;
                 let auth = SpacetimeAuth {
                     creds,
-                    identity: Identity::from_hex(claims.hex_identity).map_err(|_| AuthorizationRejection {
-                        reason: AuthorizationRejectionReason::CantDecodeAuthorizationToken,
-                    })?,
+                    identity: claims.identity,
                 };
                 Ok(Self { auth: Some(auth) })
             }
@@ -213,7 +207,7 @@ impl headers::Header for SpacetimeIdentity {
     }
 
     fn encode<E: Extend<HeaderValue>>(&self, values: &mut E) {
-        values.extend([self.0.to_hex().try_into().unwrap()])
+        values.extend([self.0.to_hex().as_str().try_into().unwrap()])
     }
 }
 
@@ -233,7 +227,7 @@ impl headers::Header for SpacetimeIdentityToken {
     }
 }
 
-pub struct SpacetimeEnergyUsed(pub EnergyDiff);
+pub struct SpacetimeEnergyUsed(pub EnergyQuanta);
 impl headers::Header for SpacetimeEnergyUsed {
     fn name() -> &'static http::HeaderName {
         static NAME: http::HeaderName = http::HeaderName::from_static("spacetime-energy-used");
@@ -246,7 +240,7 @@ impl headers::Header for SpacetimeEnergyUsed {
 
     fn encode<E: Extend<HeaderValue>>(&self, values: &mut E) {
         let mut buf = BytesMut::new();
-        let _ = buf.write_str(itoa::Buffer::new().format(self.0 .0));
+        let _ = buf.write_str(itoa::Buffer::new().format(self.0.get()));
         values.extend([HeaderValue::from_bytes(&buf).unwrap()]);
     }
 }

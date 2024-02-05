@@ -6,16 +6,18 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Mutex;
 use std::time::Duration;
+use sys::Buffer;
 
+use crate::sats::db::def::{ColumnDef, ConstraintDef, IndexDef, SequenceDef, TableDef};
 use crate::timestamp::with_timestamp_set;
 use crate::{sys, ReducerContext, ScheduleToken, SpacetimeType, TableType, Timestamp};
-use spacetimedb_lib::auth::{StAccess, StTableType};
 use spacetimedb_lib::de::{self, Deserialize, SeqProductAccess};
+use spacetimedb_lib::sats::db::auth::{StAccess, StTableType};
 use spacetimedb_lib::sats::typespace::TypespaceBuilder;
 use spacetimedb_lib::sats::{impl_deserialize, impl_serialize, AlgebraicType, AlgebraicTypeRef, ProductTypeElement};
 use spacetimedb_lib::ser::{Serialize, SerializeSeqProduct};
-use spacetimedb_lib::{bsatn, Address, Identity, MiscModuleExport, ModuleDef, ReducerDef, TableDef, TypeAlias};
-use sys::Buffer;
+use spacetimedb_lib::{bsatn, Address, Identity, MiscModuleExport, ModuleDef, ReducerDef, TableDesc, TypeAlias};
+use spacetimedb_primitives::*;
 
 pub use once_cell::sync::{Lazy, OnceCell};
 
@@ -62,23 +64,9 @@ pub fn invoke_reducer<'a, A: Args<'a>, T>(
 /// Returns an invalid buffer on success
 /// and otherwise the error is written into the fresh one returned
 /// when `table_id` doesn't identify a table.
-pub fn create_index(index_name: &str, table_id: u32, index_type: sys::raw::IndexType, col_ids: Vec<u8>) -> Buffer {
+pub fn create_index(index_name: &str, table_id: TableId, index_type: sys::raw::IndexType, col_ids: Vec<u8>) -> Buffer {
     let result = sys::create_index(index_name, table_id, index_type as u8, &col_ids);
     cvt_result(result.map_err(cvt_errno))
-}
-
-/// Runs the on-connect function `f` provided with a new reducer context
-/// created from `sender` and `timestamp`.
-pub fn invoke_connection_func<R: ReducerResult>(
-    f: impl Fn(ReducerContext) -> R,
-    sender: Buffer,
-    client_address: Buffer,
-    timestamp: u64,
-) -> Buffer {
-    let ctx = assemble_context(sender, timestamp, client_address);
-
-    let res = with_timestamp_set(ctx.timestamp, || f(ctx).into_result());
-    cvt_result(res)
 }
 
 /// Creates a reducer context from the given `sender`, `timestamp` and `client_address`.
@@ -97,7 +85,7 @@ fn assemble_context(sender: Buffer, timestamp: u64, client_address: Buffer) -> R
 
     let address = Address::from_arr(&client_address.read_array::<16>());
 
-    let address = if address == Address::__dummy() {
+    let address = if address == Address::__DUMMY {
         None
     } else {
         Some(address)
@@ -205,9 +193,9 @@ pub trait ReducerArg<'de> {}
 impl<'de, T: Deserialize<'de>> ReducerArg<'de> for T {}
 impl ReducerArg<'_> for ReducerContext {}
 /// Assert that `T: ReducerArg`.
-pub fn assert_reducerarg<'de, T: ReducerArg<'de>>() {}
+pub fn assert_reducer_arg<'de, T: ReducerArg<'de>>() {}
 /// Assert that `T: ReducerResult`.
-pub fn assert_reducerret<T: ReducerResult>() {}
+pub fn assert_reducer_ret<T: ReducerResult>() {}
 /// Assert that `T: TableType`.
 pub const fn assert_table<T: TableType>() {}
 
@@ -414,24 +402,80 @@ pub fn register_reftype<T: SpacetimeType>() {
 pub fn register_table<T: TableType>() {
     register_describer(|module| {
         let data = *T::make_type(module).as_ref().unwrap();
-        let schema = TableDef {
-            name: T::TABLE_NAME.into(),
-            data,
-            column_attrs: T::COLUMN_ATTRS.to_owned(),
-            indexes: T::INDEXES.iter().copied().map(Into::into).collect(),
-            table_type: StTableType::User,
-            table_access: StAccess::for_name(T::TABLE_NAME),
-        };
+        let columns = module
+            .module
+            .typespace
+            .with_type(&data)
+            .resolve_refs()
+            .and_then(|x| {
+                if let Ok(x) = x.into_product() {
+                    let cols: Vec<ColumnDef> = x.into();
+                    Some(cols)
+                } else {
+                    None
+                }
+            })
+            .expect("Fail to retrieve the columns from the module");
+
+        let indexes: Vec<_> = T::INDEXES.iter().copied().map(Into::into).collect();
+        //WARNING: The definition  of table assumes the # of constraints == # of columns elsewhere `T::COLUMN_ATTRS` is queried
+        let constraints: Vec<_> = T::COLUMN_ATTRS
+            .iter()
+            .enumerate()
+            .map(|(col_pos, x)| {
+                let col = &columns[col_pos];
+                let kind = match (*x).try_into() {
+                    Ok(x) => x,
+                    Err(_) => Constraints::unset(),
+                };
+
+                ConstraintDef::for_column(T::TABLE_NAME, &col.col_name, kind, ColList::new(col_pos.into()))
+            })
+            .collect();
+
+        let sequences: Vec<_> = T::COLUMN_ATTRS
+            .iter()
+            .enumerate()
+            .filter_map(|(col_pos, x)| {
+                let col = &columns[col_pos];
+
+                if x.kind() == AttributeKind::AUTO_INC {
+                    Some(SequenceDef::for_column(T::TABLE_NAME, &col.col_name, col_pos.into()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let schema = TableDef::new(T::TABLE_NAME.into(), columns)
+            .with_type(StTableType::User)
+            .with_access(StAccess::for_name(T::TABLE_NAME))
+            .with_constraints(constraints)
+            .with_sequences(sequences)
+            .with_indexes(indexes);
+        let schema = TableDesc { schema, data };
+
         module.module.tables.push(schema)
     })
 }
 
-impl From<crate::IndexDef<'_>> for spacetimedb_lib::IndexDef {
-    fn from(index: crate::IndexDef<'_>) -> spacetimedb_lib::IndexDef {
-        spacetimedb_lib::IndexDef {
-            name: index.name.to_owned(),
-            ty: index.ty,
-            col_ids: index.col_ids.to_owned(),
+impl From<crate::IndexDesc<'_>> for IndexDef {
+    fn from(index: crate::IndexDesc<'_>) -> IndexDef {
+        let Ok(columns) = index
+            .col_ids
+            .iter()
+            .map(|x| (*x).into())
+            .collect::<ColListBuilder>()
+            .build()
+        else {
+            panic!("Need at least one column in IndexDesc for index `{}`", index.name);
+        };
+
+        IndexDef {
+            index_name: index.name.to_string(),
+            is_unique: false,
+            index_type: index.ty,
+            columns,
         }
     }
 }
@@ -467,7 +511,7 @@ impl TypespaceBuilder for ModuleBuilder {
             btree_map::Entry::Occupied(o) => *o.get(),
             btree_map::Entry::Vacant(v) => {
                 // Bind a fresh alias to the unit type.
-                let slot_ref = self.module.typespace.add(AlgebraicType::UNIT_TYPE);
+                let slot_ref = self.module.typespace.add(AlgebraicType::unit());
                 // Relate `typeid -> fresh alias`.
                 v.insert(slot_ref);
 

@@ -4,7 +4,10 @@ use crate::{
 };
 use anyhow::Context;
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use tabled::{object::Columns, Alignment, Modify, Style, Table, Tabled};
+use tabled::{
+    settings::{object::Columns, Alignment, Modify, Style},
+    Table, Tabled,
+};
 
 pub fn cli() -> Command {
     Command::new("server")
@@ -170,7 +173,8 @@ pub async fn exec_list(config: Config, _args: &ArgMatches) -> Result<(), anyhow:
         });
     }
 
-    let table = Table::new(&rows)
+    let mut table = Table::new(&rows);
+    table
         .with(Style::empty())
         .with(Modify::new(Columns::first()).with(Alignment::right()));
     println!("{}", table);
@@ -347,12 +351,17 @@ pub async fn exec_ping(config: Config, args: &ArgMatches) -> Result<(), anyhow::
     let url = config.get_host_url(server)?;
 
     let builder = reqwest::Client::new().get(format!("{}/database/ping", url).as_str());
-    match builder.send().await {
-        Ok(_) => {
+    let response = builder.send().await?;
+
+    match response.status() {
+        reqwest::StatusCode::OK => {
             println!("Server is online: {}", url);
         }
-        Err(_) => {
-            println!("Server could not be reached: {}", url);
+        reqwest::StatusCode::NOT_FOUND => {
+            println!("Server returned 404 (Not Found): {}", url);
+        }
+        err => {
+            println!("Server could not be reached ({}): {}", err, url);
         }
     }
     Ok(())

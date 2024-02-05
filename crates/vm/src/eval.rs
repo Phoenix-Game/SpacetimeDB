@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
-use spacetimedb_lib::relation::{FieldExpr, MemTable, RelIter, Relation, Table};
 use spacetimedb_sats::algebraic_type::AlgebraicType;
 use spacetimedb_sats::algebraic_value::AlgebraicValue;
-use spacetimedb_sats::builtin_type::BuiltinType;
+use spacetimedb_sats::relation::{FieldExpr, MemTable, RelIter, Relation, Table};
 use spacetimedb_sats::{product, ProductType, ProductValue};
 
 use crate::dsl::{bin_op, call_fn, if_, mem_table, scalar, var};
@@ -77,63 +76,55 @@ fn build_typed<P: ProgramVm>(p: &mut P, node: Expr) -> ExprOpt {
                 ExprOpt::CallLambda(name, params.collect())
             }
         }
-        Expr::Crud(q) => match *q {
-            CrudExpr::Query(q) => {
-                let source = build_query_opt(q);
+        Expr::Crud(q) => {
+            let q = q.optimize(&|_, _| i64::MAX);
+            match q {
+                CrudExpr::Query(q) => {
+                    let source = build_query_opt(q);
 
-                ExprOpt::Query(Box::new(source))
-            }
-            CrudExpr::Insert { source, rows: data } => {
-                let source = build_source(source);
-                let mut rows = Vec::with_capacity(data.len());
-                for x in data {
-                    let mut row = Vec::with_capacity(x.len());
-                    for v in x {
-                        match v {
-                            FieldExpr::Name(x) => {
-                                todo!("Deal with idents in insert?: {}", x)
-                            }
-                            FieldExpr::Value(x) => {
-                                row.push(x);
+                    ExprOpt::Query(Box::new(source))
+                }
+                CrudExpr::Insert { source, rows: data } => {
+                    let source = build_source(source);
+                    let mut rows = Vec::with_capacity(data.len());
+                    for x in data {
+                        let mut row = Vec::with_capacity(x.len());
+                        for v in x {
+                            match v {
+                                FieldExpr::Name(x) => {
+                                    todo!("Deal with idents in insert?: {}", x)
+                                }
+                                FieldExpr::Value(x) => {
+                                    row.push(x);
+                                }
                             }
                         }
+                        rows.push(ProductValue::new(&row))
                     }
-                    rows.push(ProductValue::new(&row))
+                    ExprOpt::Crud(Box::new(CrudExprOpt::Insert { source, rows }))
                 }
-                ExprOpt::Crud(Box::new(CrudExprOpt::Insert { source, rows }))
-            }
-            CrudExpr::Update { insert, delete } => {
-                let insert = build_query_opt(insert);
-                let delete = build_query_opt(delete);
+                CrudExpr::Update { delete, assignments } => {
+                    let delete = build_query_opt(delete);
 
-                ExprOpt::Crud(Box::new(CrudExprOpt::Update { insert, delete }))
-            }
-            CrudExpr::Delete { query } => {
-                let query = build_query_opt(query);
+                    ExprOpt::Crud(Box::new(CrudExprOpt::Update { delete, assignments }))
+                }
+                CrudExpr::Delete { query } => {
+                    let query = build_query_opt(query);
 
-                ExprOpt::Crud(Box::new(CrudExprOpt::Delete { query }))
+                    ExprOpt::Crud(Box::new(CrudExprOpt::Delete { query }))
+                }
+                CrudExpr::CreateTable { table } => ExprOpt::Crud(Box::new(CrudExprOpt::CreateTable { table })),
+                CrudExpr::Drop {
+                    name,
+                    kind,
+                    table_access,
+                } => ExprOpt::Crud(Box::new(CrudExprOpt::Drop {
+                    name,
+                    kind,
+                    table_access,
+                })),
             }
-            CrudExpr::CreateTable {
-                name,
-                columns,
-                table_type,
-                table_access,
-            } => ExprOpt::Crud(Box::new(CrudExprOpt::CreateTable {
-                name,
-                columns,
-                table_type,
-                table_access,
-            })),
-            CrudExpr::Drop {
-                name,
-                kind,
-                table_access,
-            } => ExprOpt::Crud(Box::new(CrudExprOpt::Drop {
-                name,
-                kind,
-                table_access,
-            })),
-        },
+        }
         x => {
             todo!("{:?}", x)
         }
@@ -271,26 +262,15 @@ fn compile<P: ProgramVm>(p: &mut P, node: ExprOpt) -> Result<Code, ErrorVm> {
                     };
                     Code::Crud(q)
                 }
-                CrudExprOpt::Update { insert, delete } => {
-                    let insert = compile_query(insert);
+                CrudExprOpt::Update { delete, assignments } => {
                     let delete = compile_query(delete);
-                    Code::Crud(CrudCode::Update { insert, delete })
+                    Code::Crud(CrudCode::Update { delete, assignments })
                 }
                 CrudExprOpt::Delete { query } => {
                     let query = compile_query(query);
                     Code::Crud(CrudCode::Delete { query })
                 }
-                CrudExprOpt::CreateTable {
-                    name,
-                    columns,
-                    table_type,
-                    table_access,
-                } => Code::Crud(CrudCode::CreateTable {
-                    name,
-                    columns,
-                    table_type,
-                    table_access,
-                }),
+                CrudExprOpt::CreateTable { table } => Code::Crud(CrudCode::CreateTable { table }),
                 CrudExprOpt::Drop {
                     name,
                     kind,
@@ -434,7 +414,7 @@ pub fn build_query(mut result: Box<IterRows>, query: Vec<Query>) -> Result<Box<I
                 let key_rhs = col_rhs.clone();
                 let row_rhs = q.rhs.source.row_count();
 
-                let head = q.rhs.source.head();
+                let head = q.rhs.source.head().clone();
                 let rhs = match q.rhs.source {
                     SourceExpr::MemTable(x) => Box::new(RelIter::new(head, row_rhs, x)) as Box<IterRows<'_>>,
                     SourceExpr::DbTable(_) => {
@@ -459,16 +439,16 @@ pub fn build_query(mut result: Box<IterRows>, query: Vec<Query>) -> Result<Box<I
                     rhs,
                     col_lhs_header.extend(&col_rhs_header),
                     move |row| {
-                        let f = row.get(&key_lhs, &key_lhs_header);
+                        let f = row.get(&key_lhs, &key_lhs_header)?;
                         Ok(f.into())
                     },
                     move |row| {
-                        let f = row.get(&key_rhs, &key_rhs_header);
+                        let f = row.get(&key_rhs, &key_rhs_header)?;
                         Ok(f.into())
                     },
                     move |l, r| {
-                        let l = l.get(&col_lhs, &col_lhs_header);
-                        let r = r.get(&col_rhs, &col_rhs_header);
+                        let l = l.get(&col_lhs, &col_lhs_header)?;
+                        let r = r.get(&col_rhs, &col_rhs_header)?;
                         Ok(l == r)
                     },
                     move |l, r| l.extend(r),
@@ -532,20 +512,20 @@ pub struct GameData {
 // Used internally for testing  SQL JOINS
 #[doc(hidden)]
 pub fn create_game_data() -> GameData {
-    let head = ProductType::from_iter([("inventory_id", BuiltinType::U64), ("name", BuiltinType::String)]);
+    let head = ProductType::from([("inventory_id", AlgebraicType::U64), ("name", AlgebraicType::String)]);
     let row = product!(1u64, "health");
     let inv = mem_table(head, [row]);
 
-    let head = ProductType::from_iter([("entity_id", BuiltinType::U64), ("inventory_id", BuiltinType::U64)]);
+    let head = ProductType::from([("entity_id", AlgebraicType::U64), ("inventory_id", AlgebraicType::U64)]);
     let row1 = product!(100u64, 1u64);
     let row2 = product!(200u64, 1u64);
     let row3 = product!(300u64, 1u64);
     let player = mem_table(head, [row1, row2, row3]);
 
-    let head = ProductType::from_iter([
-        ("entity_id", BuiltinType::U64),
-        ("x", BuiltinType::F32),
-        ("z", BuiltinType::F32),
+    let head = ProductType::from([
+        ("entity_id", AlgebraicType::U64),
+        ("x", AlgebraicType::F32),
+        ("z", AlgebraicType::F32),
     ]);
     let row1 = product!(100u64, 0.0f32, 32.0f32);
     let row2 = product!(100u64, 1.0f32, 31.0f32);
@@ -561,10 +541,10 @@ mod tests {
     use super::*;
     use crate::dsl::{prefix_op, query, value};
     use crate::program::Program;
-    use spacetimedb_lib::auth::StAccess;
-    use spacetimedb_lib::error::RelationError;
     use spacetimedb_lib::identity::AuthCtx;
-    use spacetimedb_lib::relation::{FieldName, MemTable, RelValue};
+    use spacetimedb_sats::db::auth::StAccess;
+    use spacetimedb_sats::db::error::RelationError;
+    use spacetimedb_sats::relation::{FieldName, MemTable, RelValue};
 
     fn fib(n: u64) -> u64 {
         if n < 2 {
@@ -731,17 +711,17 @@ mod tests {
     fn test_select() {
         let p = &mut Program::new(AuthCtx::for_testing());
         let input = MemTable::from_value(scalar(1));
-        let field = input.get_field(0).unwrap().clone();
+        let field = input.get_field_pos(0).unwrap().clone();
 
         let q = query(input).with_select_cmp(OpCmp::Eq, field, scalar(1));
 
-        let head = q.source.head();
+        let head = q.source.head().clone();
 
         let result = run_ast(p, q.into());
         let row = RelValue::new(scalar(1).into(), None);
         assert_eq!(
             result,
-            Code::Table(MemTable::new(&head, StAccess::Public, &[row])),
+            Code::Table(MemTable::new(head, StAccess::Public, [row].into())),
             "Query"
         );
     }
@@ -751,17 +731,17 @@ mod tests {
         let p = &mut Program::new(AuthCtx::for_testing());
         let input = scalar(1);
         let table = MemTable::from_value(scalar(1));
-        let field = table.get_field(0).unwrap().clone();
+        let field = table.get_field_pos(0).unwrap().clone();
 
         let source = query(table.clone());
         let q = source.clone().with_project(&[field.into()], None);
-        let head = q.source.head();
+        let head = q.source.head().clone();
 
         let result = run_ast(p, q.into());
         let row = RelValue::new(input.into(), None);
         assert_eq!(
             result,
-            Code::Table(MemTable::new(&head, StAccess::Public, &[row])),
+            Code::Table(MemTable::new(head.clone(), StAccess::Public, [row].into())),
             "Project"
         );
 
@@ -780,7 +760,7 @@ mod tests {
     fn test_join_inner() {
         let p = &mut Program::new(AuthCtx::for_testing());
         let table = MemTable::from_value(scalar(1));
-        let field = table.get_field(0).unwrap().clone();
+        let field = table.get_field_pos(0).unwrap().clone();
 
         let q = query(table.clone()).with_join_inner(table, field.clone(), field);
         let result = match run_ast(p, q.into()) {
@@ -789,7 +769,7 @@ mod tests {
         };
 
         //The expected result
-        let inv = ProductType::from_iter([(None, BuiltinType::I32), (Some("0_0"), BuiltinType::I32)]);
+        let inv = ProductType::from([(None, AlgebraicType::I32), (Some("0_0"), AlgebraicType::I32)]);
         let row = product!(scalar(1), scalar(1));
         let input = mem_table(inv, vec![row]);
 
@@ -803,7 +783,7 @@ mod tests {
     fn test_query_logic() {
         let p = &mut Program::new(AuthCtx::for_testing());
 
-        let inv = ProductType::from_iter([("id", BuiltinType::U64), ("name", BuiltinType::String)]);
+        let inv = ProductType::from([("id", AlgebraicType::U64), ("name", AlgebraicType::String)]);
 
         let row = product!(scalar(1u64), scalar("health"));
 
@@ -829,12 +809,12 @@ mod tests {
     fn test_query() {
         let p = &mut Program::new(AuthCtx::for_testing());
 
-        let inv = ProductType::from_iter([("id", BuiltinType::U64), ("name", BuiltinType::String)]);
+        let inv = ProductType::from([("id", AlgebraicType::U64), ("name", AlgebraicType::String)]);
 
         let row = product!(scalar(1u64), scalar("health"));
 
         let input = mem_table(inv, vec![row]);
-        let field = input.get_field(0).unwrap().clone();
+        let field = input.get_field_pos(0).unwrap().clone();
 
         let q = query(input.clone()).with_join_inner(input, field.clone(), field);
 
@@ -844,10 +824,10 @@ mod tests {
         };
 
         //The expected result
-        let inv = ProductType::from_iter([
-            (None, BuiltinType::U64),
-            (Some("id"), BuiltinType::U64),
-            (Some("name"), BuiltinType::String),
+        let inv = ProductType::from([
+            (None, AlgebraicType::U64),
+            (Some("id"), AlgebraicType::U64),
+            (Some("name"), AlgebraicType::String),
         ]);
         let row = product!(scalar(1u64), scalar("health"), scalar(1u64), scalar("health"));
         let input = mem_table(inv, vec![row]);
@@ -899,7 +879,7 @@ mod tests {
 
         let result = run_query(p, q.into());
 
-        let head = ProductType::from_iter([("entity_id", BuiltinType::U64), ("inventory_id", BuiltinType::U64)]);
+        let head = ProductType::from([("entity_id", AlgebraicType::U64), ("inventory_id", AlgebraicType::U64)]);
         let row1 = product!(100u64, 1u64);
         let input = mem_table(head, [row1]);
 
@@ -925,7 +905,7 @@ mod tests {
 
         let result = run_query(p, q.into());
 
-        let head = ProductType::from_iter([("inventory_id", BuiltinType::U64), ("name", BuiltinType::String)]);
+        let head = ProductType::from([("inventory_id", AlgebraicType::U64), ("name", AlgebraicType::String)]);
         let row1 = product!(1u64, "health");
         let input = mem_table(head, [row1]);
 

@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - master
+  merge_group:
 
 name: CI
 
@@ -16,8 +17,12 @@ jobs:
       - name: Start containers
         run: docker compose up -d
       - name: Run smoketests
-        run: test/run-smoke-tests.sh --parallel -x bitcraftmini-pretest
-      - name: Stop containers 
+        run: test/run-smoke-tests.sh --parallel -x bitcraftmini-pretest zz_docker-restart-module zz_docker-restart-repeating-reducer zz_docker-restart-sql
+      # These cannot run in parallel, even though the script tries to handle it
+      # TODO: Fix flaky tests https://github.com/clockworklabs/SpacetimeDB/issues/630
+      # - name: Run restarting smoketests
+      #   run: test/run-smoke-tests.sh zz_docker-restart-module zz_docker-restart-repeating-reducer zz_docker-restart-sql
+      - name: Stop containers
         if: always()
         run: docker compose down
 
@@ -30,13 +35,17 @@ jobs:
 
       - uses: dsherret/rust-toolchain-file@v1
 
+      - uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '8.x'
+
       - name: Create /stdb dir
         run: |
           sudo mkdir /stdb
           sudo chmod 777 /stdb
 
       - name: Run cargo test
-        run: cargo test --all --exclude test-client --exclude connect_disconnect_client --features odb_rocksdb,odb_sled
+        run: cargo test --all --features odb_rocksdb,odb_sled,metrics
 
   lints:
     name: Lints
@@ -52,7 +61,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run cargo clippy
-        run: cargo clippy --all --exclude test-client --exclude connect_disconnect_client --tests --features odb_rocksdb,odb_sled -- -D warnings
+        run: cargo clippy --all --tests --features odb_rocksdb,odb_sled,metrics -- -D warnings
+
+      - name: Check benchmarks
+        run: cd crates/bench && cargo check --benches
 
   wasm_bindings:
     name: Build and test wasm bindings

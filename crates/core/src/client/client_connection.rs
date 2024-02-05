@@ -2,7 +2,8 @@ use std::ops::Deref;
 
 use crate::host::{ModuleHost, NoSuchModule, ReducerArgs, ReducerCallError, ReducerCallResult};
 use crate::protobuf::client_api::Subscribe;
-use crate::worker_metrics::{CONNECTED_CLIENTS, WEBSOCKET_SENT, WEBSOCKET_SENT_MSG_SIZE};
+use crate::util::prometheus_handle::IntGaugeExt;
+use crate::worker_metrics::WORKER_METRICS;
 use derive_more::From;
 use futures::prelude::*;
 use tokio::sync::mpsc;
@@ -42,12 +43,11 @@ impl ClientConnectionSender {
 
         self.sendtx.send(message).await.map_err(|_| ClientClosed)?;
 
-        WEBSOCKET_SENT
-            .with_label_values(&[self.id.identity.to_hex().as_str()])
-            .inc();
+        WORKER_METRICS.websocket_sent.with_label_values(&self.id.identity).inc();
 
-        WEBSOCKET_SENT_MSG_SIZE
-            .with_label_values(&[self.id.identity.to_hex().as_str()])
+        WORKER_METRICS
+            .websocket_sent_msg_size
+            .with_label_values(&self.id.identity)
             .observe(bytes_len as f64);
 
         Ok(())
@@ -97,7 +97,7 @@ impl ClientConnection {
         database_instance_id: u64,
         module: ModuleHost,
         actor: F,
-    ) -> Result<ClientConnection, NoSuchModule>
+    ) -> Result<ClientConnection, ReducerCallError>
     where
         F: FnOnce(ClientConnection, mpsc::Receiver<DataMessage>) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
@@ -113,6 +113,8 @@ impl ClientConnection {
         // Buffer up to 64 client messages
         let (sendtx, sendrx) = mpsc::channel::<DataMessage>(64);
 
+        let db = module.info().address;
+
         let sender = ClientConnectionSender { id, protocol, sendtx };
         let this = Self {
             sender,
@@ -121,11 +123,8 @@ impl ClientConnection {
         };
 
         let actor_fut = actor(this.clone(), sendrx);
-        tokio::spawn(async move {
-            CONNECTED_CLIENTS.inc();
-            actor_fut.await;
-            CONNECTED_CLIENTS.dec();
-        });
+        let gauge_guard = WORKER_METRICS.connected_clients.with_label_values(&db).inc_scope();
+        tokio::spawn(actor_fut.map(|()| drop(gauge_guard)));
 
         Ok(this)
     }

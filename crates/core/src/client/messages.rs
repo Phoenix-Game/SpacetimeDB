@@ -1,7 +1,5 @@
 use base64::Engine;
 use prost::Message as _;
-use spacetimedb_client_api_messages::client_api::{OneOffQueryResponse, OneOffTable};
-use spacetimedb_lib::{relation::MemTable, Address};
 
 use crate::host::module_host::{DatabaseUpdate, EventStatus, ModuleEvent};
 use crate::identity::Identity;
@@ -10,6 +8,9 @@ use crate::json::client_api::{
     TransactionUpdateJson,
 };
 use crate::protobuf::client_api::{event, message, Event, FunctionCall, IdentityToken, Message, TransactionUpdate};
+use spacetimedb_client_api_messages::client_api::{OneOffQueryResponse, OneOffTable};
+use spacetimedb_lib::Address;
+use spacetimedb_sats::relation::MemTable;
 
 use super::{DataMessage, Protocol};
 
@@ -35,9 +36,9 @@ pub struct IdentityTokenMessage {
 impl ServerMessage for IdentityTokenMessage {
     fn serialize_text(self) -> MessageJson {
         MessageJson::IdentityToken(IdentityTokenJson {
-            identity: self.identity.to_hex(),
+            identity: self.identity,
             token: self.identity_token,
-            address: self.address.to_hex(),
+            address: self.address,
         })
     }
     fn serialize_binary(self) -> Message {
@@ -52,7 +53,7 @@ impl ServerMessage for IdentityTokenMessage {
 }
 
 pub struct TransactionUpdateMessage<'a> {
-    pub event: &'a mut ModuleEvent,
+    pub event: &'a ModuleEvent,
     pub database_update: DatabaseUpdate,
 }
 
@@ -68,14 +69,14 @@ impl ServerMessage for TransactionUpdateMessage<'_> {
         let event = EventJson {
             timestamp: event.timestamp.0,
             status: status_str.to_string(),
-            caller_identity: event.caller_identity.to_hex(),
+            caller_identity: event.caller_identity,
             function_call: FunctionCallJson {
                 reducer: event.function_call.reducer.to_owned(),
                 args: event.function_call.args.get_json().clone(),
             },
-            energy_quanta_used: event.energy_quanta_used.0,
+            energy_quanta_used: event.energy_quanta_used.get(),
             message: errmsg,
-            caller_address: event.caller_address.unwrap_or(Address::ZERO).to_hex(),
+            caller_address: event.caller_address.unwrap_or(Address::__DUMMY),
         };
 
         let subscription_update = database_update.into_json();
@@ -102,7 +103,7 @@ impl ServerMessage for TransactionUpdateMessage<'_> {
                 arg_bytes: event.function_call.args.get_bsatn().clone().into(),
             }),
             message: errmsg,
-            energy_quanta_used: event.energy_quanta_used.0 as i64,
+            energy_quanta_used: event.energy_quanta_used.get() as i64,
             host_execution_duration_micros: event.host_execution_duration.as_micros() as u64,
             caller_address: event.caller_address.unwrap_or(Address::zero()).as_slice().to_vec(),
         };
@@ -123,14 +124,14 @@ impl ServerMessage for TransactionUpdateMessage<'_> {
 impl ServerMessage for &mut TransactionUpdateMessage<'_> {
     fn serialize_text(self) -> MessageJson {
         TransactionUpdateMessage {
-            event: &mut *self.event,
+            event: self.event,
             database_update: self.database_update.clone(),
         }
         .serialize_text()
     }
     fn serialize_binary(self) -> Message {
         TransactionUpdateMessage {
-            event: &mut *self.event,
+            event: self.event,
             database_update: self.database_update.clone(),
         }
         .serialize_binary()

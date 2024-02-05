@@ -1,5 +1,8 @@
 use spacetimedb_bindings_macro::{Deserialize, Serialize};
-use spacetimedb_sats::{impl_st, AlgebraicType, ProductTypeElement};
+use spacetimedb_metrics::impl_prometheusvalue_string;
+use spacetimedb_metrics::typed_prometheus::AsPrometheusLabel;
+use spacetimedb_sats::hex::HexString;
+use spacetimedb_sats::{hash, impl_st, AlgebraicType};
 use std::{fmt, str::FromStr};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -30,15 +33,12 @@ pub struct Identity {
     __identity_bytes: [u8; 32],
 }
 
-impl_st!([] Identity, _ts => AlgebraicType::product(vec![
-    ProductTypeElement::new_named(AlgebraicType::bytes(), "__identity_bytes")
-]));
+impl_st!([] Identity, _ts => Identity::get_type());
+impl_prometheusvalue_string!(Identity);
 
 impl Identity {
-    const ABBREVIATION_LEN: usize = 16;
-
     /// Returns an `Identity` defined as the given `bytes` byte array.
-    pub fn from_byte_array(bytes: [u8; 32]) -> Self {
+    pub const fn from_byte_array(bytes: [u8; 32]) -> Self {
         Self {
             __identity_bytes: bytes,
         }
@@ -54,6 +54,10 @@ impl Identity {
         Self::from_byte_array([0; 32])
     }
 
+    pub fn get_type() -> AlgebraicType {
+        AlgebraicType::product([("__identity_bytes", AlgebraicType::bytes())])
+    }
+
     /// Returns a borrowed view of the byte array defining this `Identity`.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.__identity_bytes
@@ -63,12 +67,16 @@ impl Identity {
         self.__identity_bytes.to_vec()
     }
 
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.__identity_bytes)
+    pub fn to_hex(&self) -> HexString<32> {
+        spacetimedb_sats::hex::encode(&self.__identity_bytes)
     }
 
-    pub fn to_abbreviated_hex(&self) -> String {
-        self.to_hex()[0..Identity::ABBREVIATION_LEN].to_owned()
+    pub fn abbreviate(&self) -> &[u8; 8] {
+        self.__identity_bytes[..8].try_into().unwrap()
+    }
+
+    pub fn to_abbreviated_hex(&self) -> HexString<8> {
+        spacetimedb_sats::hex::encode(self.abbreviate())
     }
 
     pub fn from_hex(hex: impl AsRef<[u8]>) -> Result<Self, hex::FromHexError> {
@@ -76,19 +84,19 @@ impl Identity {
     }
 
     pub fn from_hashing_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        Identity::from_byte_array(crate::hash::hash_bytes(bytes).data)
+        Identity::from_byte_array(hash::hash_bytes(bytes).data)
     }
 }
 
 impl fmt::Display for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&hex::encode(self.__identity_bytes))
+        f.pad(&self.to_hex())
     }
 }
 
 impl fmt::Debug for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Identity").field(&format_args!("{self}")).finish()
+        f.debug_tuple("Identity").field(&self.to_hex()).finish()
     }
 }
 
@@ -112,13 +120,14 @@ impl FromStr for Identity {
 #[cfg(feature = "serde")]
 impl serde::Serialize for Identity {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        spacetimedb_sats::ser::serde::serialize_to(self, serializer)
+        spacetimedb_sats::ser::serde::serialize_to(self.as_bytes(), serializer)
     }
 }
 
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Identity {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        spacetimedb_sats::de::serde::deserialize_from(deserializer)
+        let arr = spacetimedb_sats::de::serde::deserialize_from(deserializer)?;
+        Ok(Identity::from_byte_array(arr))
     }
 }

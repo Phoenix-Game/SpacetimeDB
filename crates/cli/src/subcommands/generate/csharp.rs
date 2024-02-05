@@ -3,10 +3,12 @@ use super::util::fmt_fn;
 use std::fmt::{self, Write};
 
 use convert_case::{Case, Casing};
+use spacetimedb_lib::sats::db::def::TableSchema;
 use spacetimedb_lib::sats::{
     AlgebraicType, AlgebraicType::Builtin, AlgebraicTypeRef, ArrayType, BuiltinType, MapType, ProductType, SumType,
 };
-use spacetimedb_lib::{ColumnIndexAttribute, ProductTypeElement, ReducerDef, TableDef};
+use spacetimedb_lib::{ReducerDef, TableDesc};
+use spacetimedb_primitives::ColList;
 
 use super::code_indenter::CodeIndenter;
 use super::{GenCtx, GenItem, INDENT};
@@ -555,16 +557,29 @@ pub fn autogen_csharp_tuple(ctx: &GenCtx, name: &str, tuple: &ProductType, names
     autogen_csharp_product_table_common(ctx, name, tuple, None, namespace)
 }
 
-pub fn autogen_csharp_table(ctx: &GenCtx, table: &TableDef, namespace: &str) -> String {
+pub fn autogen_csharp_table(ctx: &GenCtx, table: &TableDesc, namespace: &str) -> String {
     let tuple = ctx.typespace[table.data].as_product().unwrap();
-    autogen_csharp_product_table_common(ctx, &table.name, tuple, Some(&table.column_attrs), namespace)
+    autogen_csharp_product_table_common(
+        ctx,
+        &table.schema.table_name,
+        tuple,
+        Some(
+            table
+                .schema
+                .clone()
+                .into_schema(0.into())
+                .validated()
+                .expect("Failed to generate table due to validation errors"),
+        ),
+        namespace,
+    )
 }
 
 fn autogen_csharp_product_table_common(
     ctx: &GenCtx,
     name: &str,
     product_type: &ProductType,
-    column_attrs: Option<&[ColumnIndexAttribute]>,
+    schema: Option<TableSchema>,
     namespace: &str,
 ) -> String {
     let mut output = CodeIndenter::new(String::new());
@@ -589,6 +604,11 @@ fn autogen_csharp_product_table_common(
     writeln!(output, "{{").unwrap();
     {
         indent_scope!(output);
+        writeln!(
+            output,
+            "[Newtonsoft.Json.JsonObject(Newtonsoft.Json.MemberSerialization.OptIn)]"
+        )
+        .unwrap();
         writeln!(output, "public partial class {name} : IDatabaseTable").unwrap();
         writeln!(output, "{{").unwrap();
         {
@@ -643,17 +663,15 @@ fn autogen_csharp_product_table_common(
             writeln!(output).unwrap();
 
             // If this is a table, we want to generate indexes
-            if let Some(column_attrs) = column_attrs {
-                let indexed_fields: Vec<(&ProductTypeElement, String)> = column_attrs
-                    .iter()
-                    .enumerate()
-                    .filter(|a| a.1.is_unique() || a.1.is_primary())
-                    .map(|a| &product_type.elements[a.0])
-                    .map(|f| (f, f.name.as_ref().unwrap().replace("r#", "").to_case(Case::Pascal)))
-                    .collect();
+            if let Some(schema) = &schema {
+                let constraints = schema.column_constraints();
                 // Declare custom index dictionaries
-                for (field, field_name) in &indexed_fields {
-                    let type_name = ty_fmt(ctx, &field.algebraic_type, namespace);
+                for col in schema.columns() {
+                    let field_name = col.col_name.replace("r#", "").to_case(Case::Pascal);
+                    if !constraints[&ColList::new(col.col_pos)].has_unique() {
+                        continue;
+                    }
+                    let type_name = ty_fmt(ctx, &col.col_type, namespace);
                     let comparer = if format!("{}", type_name) == "byte[]" {
                         ", new SpacetimeDB.ByteArrayComparer()"
                     } else {
@@ -676,7 +694,11 @@ fn autogen_csharp_product_table_common(
                 {
                     indent_scope!(output);
                     writeln!(output, "var val = ({name})insertedValue;").unwrap();
-                    for (_, field_name) in &indexed_fields {
+                    for col in schema.columns() {
+                        let field_name = col.col_name.replace("r#", "").to_case(Case::Pascal);
+                        if !constraints[&ColList::new(col.col_pos)].has_unique() {
+                            continue;
+                        }
                         writeln!(output, "{field_name}_Index[val.{field_name}] = val;").unwrap();
                     }
                 }
@@ -692,7 +714,11 @@ fn autogen_csharp_product_table_common(
                 {
                     indent_scope!(output);
                     writeln!(output, "var val = ({name})deletedValue;").unwrap();
-                    for (_, field_name) in &indexed_fields {
+                    for col in schema.columns() {
+                        let field_name = col.col_name.replace("r#", "").to_case(Case::Pascal);
+                        if !constraints[&ColList::new(col.col_pos)].has_unique() {
+                            continue;
+                        }
                         writeln!(output, "{field_name}_Index.Remove(val.{field_name});").unwrap();
                     }
                 }
@@ -723,7 +749,7 @@ fn autogen_csharp_product_table_common(
             writeln!(output).unwrap();
 
             // If this is a table, we want to include functions for accessing the table data
-            if let Some(column_attrs) = column_attrs {
+            if let Some(column_attrs) = &schema {
                 // Insert the funcs for accessing this struct
                 let has_primary_key =
                     autogen_csharp_access_funcs_for_struct(&mut output, name, product_type, name, column_attrs);
@@ -917,14 +943,10 @@ fn autogen_csharp_access_funcs_for_struct(
     struct_name_pascal_case: &str,
     product_type: &ProductType,
     table_name: &str,
-    column_attrs: &[ColumnIndexAttribute],
+    schema: &TableSchema,
 ) -> bool {
-    let (unique, nonunique) = column_attrs
-        .iter()
-        .copied()
-        .enumerate()
-        .partition::<Vec<_>, _>(|(_, attr)| attr.is_unique());
-    let unique_it = unique.into_iter().chain(nonunique);
+    let primary_col_idx = schema.pk();
+
     writeln!(
         output,
         "public static System.Collections.Generic.IEnumerable<{struct_name_pascal_case}> Iter()"
@@ -946,18 +968,13 @@ fn autogen_csharp_access_funcs_for_struct(
     indented_block(output, |output| {
         writeln!(output, "return SpacetimeDBClient.clientDB.Count(\"{table_name}\");",).unwrap();
     });
-    let mut primary_col_idx = None;
 
-    for (col_i, attr) in unique_it {
-        let is_unique = attr.is_unique();
-        let is_primary = attr.is_primary();
-        if is_primary {
-            if primary_col_idx.is_some() {
-                panic!("Multiple primary columns defined for table: {}", table_name);
-            } else {
-                primary_col_idx = Some(col_i);
-            }
-        }
+    let constraints = schema.column_constraints();
+    for col in schema.columns() {
+        let is_unique = constraints[&ColList::new(col.col_pos)].has_unique();
+
+        let col_i: usize = col.col_pos.into();
+
         let field = &product_type.elements[col_i];
         let field_name = field.name.as_ref().expect("autogen'd tuples should have field names");
         let field_type = &field.algebraic_type;
@@ -966,9 +983,9 @@ fn autogen_csharp_access_funcs_for_struct(
         let (field_type, csharp_field_type, is_option) = match field_type {
             AlgebraicType::Product(product) => {
                 if product.is_identity() {
-                    ("Identity".into(), "SpacetimeDB.Identity", false)
+                    ("Identity".into(), "SpacetimeDB.Identity".into(), false)
                 } else if product.is_address() {
-                    ("Address".into(), "SpacetimeDB.Address", false)
+                    ("Address".into(), "SpacetimeDB.Address".into(), false)
                 } else {
                     // TODO: We don't allow filtering on tuples right now,
                     //       it's possible we may consider it for the future.
@@ -978,7 +995,7 @@ fn autogen_csharp_access_funcs_for_struct(
             AlgebraicType::Sum(sum) => {
                 if let Some(Builtin(b)) = sum.as_option() {
                     match maybe_primitive(b) {
-                        MaybePrimitive::Primitive(ty) => (format!("{:?}", b), ty, true),
+                        MaybePrimitive::Primitive(ty) => (format!("{:?}", b), format!("{}?", ty), true),
                         _ => {
                             continue;
                         }
@@ -993,11 +1010,11 @@ fn autogen_csharp_access_funcs_for_struct(
                 continue;
             }
             AlgebraicType::Builtin(b) => match maybe_primitive(b) {
-                MaybePrimitive::Primitive(ty) => (format!("{:?}", b), ty, false),
+                MaybePrimitive::Primitive(ty) => (format!("{:?}", b), ty.into(), false),
                 MaybePrimitive::Array(ArrayType { elem_ty }) => {
                     if let Some(BuiltinType::U8) = elem_ty.as_builtin() {
                         // Do allow filtering for byte arrays
-                        ("Bytes".into(), "byte[]", false)
+                        ("Bytes".into(), "byte[]".into(), false)
                     } else {
                         // TODO: We don't allow filtering based on an array type, but we might want other functionality here in the future.
                         continue;
@@ -1028,7 +1045,7 @@ fn autogen_csharp_access_funcs_for_struct(
         writeln!(output, "{{").unwrap();
         {
             indent_scope!(output);
-            if is_unique || is_primary {
+            if is_unique {
                 writeln!(
                     output,
                     "{csharp_field_name_pascal}_Index.TryGetValue(value, out var r);"
@@ -1140,13 +1157,13 @@ fn autogen_csharp_access_funcs_for_struct(
             writeln!(
                 output,
                 "var primaryColumnValue1 = v1.AsProductValue().elements[{}];",
-                primary_col_index
+                primary_col_index.col_pos
             )
             .unwrap();
             writeln!(
                 output,
                 "var primaryColumnValue2 = v2.AsProductValue().elements[{}];",
-                primary_col_index
+                primary_col_index.col_pos
             )
             .unwrap();
             writeln!(
@@ -1166,7 +1183,12 @@ fn autogen_csharp_access_funcs_for_struct(
         writeln!(output, "{{").unwrap();
         {
             indent_scope!(output);
-            writeln!(output, "return v.AsProductValue().elements[{}];", primary_col_index).unwrap();
+            writeln!(
+                output,
+                "return v.AsProductValue().elements[{}];",
+                primary_col_index.col_pos
+            )
+            .unwrap();
         }
         writeln!(output, "}}").unwrap();
         writeln!(output).unwrap();
@@ -1182,7 +1204,7 @@ fn autogen_csharp_access_funcs_for_struct(
             writeln!(
                 output,
                 "return t.product.elements[{}].algebraicType;",
-                primary_col_index
+                primary_col_index.col_pos
             )
             .unwrap();
         }
@@ -1471,16 +1493,13 @@ pub fn autogen_csharp_reducer(ctx: &GenCtx, reducer: &ReducerDef, namespace: &st
 pub fn autogen_csharp_globals(items: &[GenItem], namespace: &str) -> Vec<Vec<(String, String)>> {
     let reducers: Vec<&ReducerDef> = items
         .iter()
-        .map(|i| {
+        .filter_map(|i| {
             if let GenItem::Reducer(reducer) = i {
                 Some(reducer)
             } else {
                 None
             }
         })
-        .filter(|r| r.is_some())
-        .flatten()
-        .filter(|r| r.name != "__init__")
         .collect();
     let reducer_names: Vec<String> = reducers
         .iter()
@@ -1632,6 +1651,7 @@ pub fn autogen_csharp_globals(items: &[GenItem], namespace: &str) -> Vec<Vec<(St
         output.indent(1);
     }
 
+    writeln!(output, "[ReducerClass]").unwrap();
     writeln!(output, "public partial class Reducer").unwrap();
     writeln!(output, "{{").unwrap();
     {

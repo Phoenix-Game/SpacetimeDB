@@ -1,7 +1,8 @@
-use crate::buffer::{BufReader, BufWriter};
-use crate::de::{Deserialize, DeserializeSeed};
+use crate::buffer::{BufReader, BufWriter, CountWriter};
+use crate::de::{BasicSmallVecVisitor, Deserialize, DeserializeSeed, Deserializer as _};
 use crate::ser::Serialize;
 use crate::Typespace;
+use smallvec::SmallVec;
 
 pub mod de;
 pub mod ser;
@@ -22,6 +23,13 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, ser::BsatnErr
     let mut v = Vec::new();
     to_writer(&mut v, value)?;
     Ok(v)
+}
+
+/// Computes the size of `val` when BSATN encoding without actually encoding.
+pub fn to_len<T: Serialize + ?Sized>(value: &T) -> Result<usize, ser::BsatnError> {
+    let mut writer = CountWriter::default();
+    to_writer(&mut writer, value)?;
+    Ok(writer.finish())
 }
 
 /// Deserialize a `T` from the BSATN format in the buffered `reader`.
@@ -49,12 +57,23 @@ macro_rules! codec_funcs {
     };
     (val: $ty:ty) => {
         impl $ty {
+            /// Decode a value from `bytes` typed at `ty`.
             pub fn decode<'a>(
-                algebraic_type: &<Self as crate::Value>::Type,
+                ty: &<Self as crate::Value>::Type,
                 bytes: &mut impl BufReader<'a>,
             ) -> Result<Self, DecodeError> {
-                crate::WithTypespace::new(&Typespace::new(Vec::new()), algebraic_type)
-                    .deserialize(Deserializer::new(bytes))
+                crate::WithTypespace::new(&Typespace::new(Vec::new()), ty).deserialize(Deserializer::new(bytes))
+            }
+
+            /// Decode a vector of values from `bytes` with each value typed at `ty`.
+            pub fn decode_smallvec<'a>(
+                ty: &<Self as crate::Value>::Type,
+                bytes: &mut impl BufReader<'a>,
+            ) -> Result<SmallVec<[Self; 1]>, DecodeError> {
+                Deserializer::new(bytes).deserialize_array_seed(
+                    BasicSmallVecVisitor,
+                    crate::WithTypespace::new(&Typespace::new(Vec::new()), ty),
+                )
             }
 
             pub fn encode(&self, bytes: &mut impl BufWriter) {
@@ -65,7 +84,6 @@ macro_rules! codec_funcs {
 }
 
 codec_funcs!(crate::AlgebraicType);
-codec_funcs!(crate::BuiltinType);
 codec_funcs!(crate::ProductType);
 codec_funcs!(crate::SumType);
 codec_funcs!(crate::ProductTypeElement);
@@ -74,4 +92,3 @@ codec_funcs!(crate::SumTypeVariant);
 codec_funcs!(val: crate::AlgebraicValue);
 codec_funcs!(val: crate::ProductValue);
 codec_funcs!(val: crate::SumValue);
-codec_funcs!(val: crate::BuiltinValue);

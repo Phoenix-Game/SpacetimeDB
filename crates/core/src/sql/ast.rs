@@ -1,8 +1,18 @@
-use spacetimedb_lib::auth::{StAccess, StTableType};
-use spacetimedb_lib::error::RelationError;
-use spacetimedb_lib::table::{ColumnDef, ProductTypeMeta};
-use spacetimedb_lib::ColumnIndexAttribute;
+use std::borrow::Cow;
+use std::collections::HashMap;
+
+use crate::db::relational_db::{MutTx, RelationalDB, Tx};
+use crate::error::{DBError, PlanError};
+use spacetimedb_primitives::{ColList, ConstraintKind, Constraints};
+use spacetimedb_sats::db::auth::StAccess;
+use spacetimedb_sats::db::def::{ColumnDef, ConstraintDef, FieldDef, TableDef, TableSchema};
+use spacetimedb_sats::db::error::RelationError;
+use spacetimedb_sats::relation::{extract_table_field, FieldExpr, FieldName};
 use spacetimedb_sats::{AlgebraicType, AlgebraicValue, ProductTypeElement};
+use spacetimedb_vm::errors::ErrorVm;
+use spacetimedb_vm::expr::{ColumnOp, DbType, Expr};
+use spacetimedb_vm::operator::{OpCmp, OpLogic, OpQuery};
+use spacetimedb_vm::ops::parse::parse;
 use sqlparser::ast::{
     Assignment, BinaryOperator, ColumnDef as SqlColumnDef, ColumnOption, DataType, ExactNumberInfo, Expr as SqlExpr,
     GeneratedAs, HiveDistributionStyle, Ident, JoinConstraint, JoinOperator, ObjectName, ObjectType, Query, Select,
@@ -10,17 +20,6 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
-use std::collections::HashMap;
-
-use crate::db::datastore::locking_tx_datastore::MutTxId;
-use crate::db::datastore::traits::{MutTxDatastore, TableId, TableSchema};
-use crate::db::relational_db::RelationalDB;
-use crate::error::{DBError, PlanError};
-use spacetimedb_lib::relation::{extract_table_field, FieldExpr, FieldName};
-use spacetimedb_vm::errors::ErrorVm;
-use spacetimedb_vm::expr::{ColumnOp, DbType, Expr};
-use spacetimedb_vm::operator::{OpCmp, OpLogic, OpQuery};
-use spacetimedb_vm::ops::parse::parse;
 
 /// Simplify to detect features of the syntax we don't support yet
 /// Because we use [PostgreSqlDialect] in the compiler step it already protect against features
@@ -52,8 +51,17 @@ impl Unsupported for HiveDistributionStyle {
     }
 }
 
+impl Unsupported for sqlparser::ast::GroupByExpr {
+    fn unsupported(&self) -> bool {
+        match self {
+            sqlparser::ast::GroupByExpr::All => true,
+            sqlparser::ast::GroupByExpr::Expressions(v) => v.unsupported(),
+        }
+    }
+}
+
 macro_rules! unsupported{
-    ($name:literal,$a:expr)=>{
+    ($name:literal,$a:expr)=>{{
         let name = stringify!($name);
         let it = stringify!($a);
         if $a.unsupported() {
@@ -62,19 +70,10 @@ macro_rules! unsupported{
 
             });
         }
-    };
-    ($name:literal,$a:expr,$b:expr)=>{
-        {
-            unsupported!($name,$a);
-            unsupported!($name,$b);
-        }
-    };
-    ($name:literal, $a:expr,$($b:tt)*)=>{
-       {
-           unsupported!($name, $a);
-           unsupported!($name, $($b)*);
-       }
-    }
+    }};
+    ($name:literal,$($a:expr),+$(,)?)=> {{
+        $(unsupported!($name,$a);)+
+    }};
 }
 
 /// A convenient wrapper for a table name (that comes from an `ObjectName`).
@@ -120,12 +119,6 @@ pub struct OnExpr {
 /// The `JOIN [INNER] ON join_expr OpCmp join_expr` clause
 pub enum Join {
     Inner { rhs: TableSchema, on: OnExpr },
-}
-
-#[derive(Clone)]
-pub struct FromField {
-    pub field: FieldName,
-    pub column: ColumnDef,
 }
 
 /// The list of tables in `... FROM table1 [JOIN table2] ...`
@@ -178,13 +171,18 @@ impl From {
 
     /// Returns all the fields matching `f` as a `Vec<FromField>`,
     /// including the ones inside the joins.
-    pub fn find_field(&self, f: &str) -> Result<Vec<FromField>, RelationError> {
+    pub fn find_field<'a>(&'a self, f: &'a str) -> Result<Vec<FieldDef>, RelationError> {
         let field = extract_table_field(f)?;
-        let fields = self.iter_tables().filter_map(|t| {
-            let f = t.normalize_field(&field);
-            t.get_column_by_field(&f).map(|column| FromField {
-                field: f,
-                column: column.into(),
+        let fields = self.iter_tables().flat_map(|t| {
+            t.columns().iter().filter_map(|column| {
+                if column.col_name == field.field {
+                    Some(FieldDef {
+                        column,
+                        table_name: field.table.unwrap_or(&t.table_name),
+                    })
+                } else {
+                    None
+                }
             })
         });
 
@@ -193,7 +191,7 @@ impl From {
 
     /// Checks if the field `named` matches exactly once in all the tables
     /// including the ones inside the joins
-    pub fn resolve_field(&self, named: &str) -> Result<FromField, PlanError> {
+    pub fn resolve_field<'a>(&'a self, named: &'a str) -> Result<FieldDef, PlanError> {
         let fields = self.find_field(named)?;
 
         match fields.len() {
@@ -208,7 +206,7 @@ impl From {
             1 => Ok(fields[0].clone()),
             _ => Err(PlanError::AmbiguousField {
                 field: named.into(),
-                found: fields.iter().map(|x| x.field.clone()).collect(),
+                found: fields.into_iter().map(Into::into).collect(),
             }),
         }
     }
@@ -236,10 +234,7 @@ pub enum SqlAst {
         selection: Option<Selection>,
     },
     CreateTable {
-        table: String,
-        columns: ProductTypeMeta,
-        table_type: StTableType,
-        table_access: StAccess,
+        table: TableDef,
     },
     Drop {
         name: String,
@@ -252,12 +247,12 @@ fn extract_field(table: &From, of: &SqlExpr) -> Result<Option<ProductTypeElement
     match of {
         SqlExpr::Identifier(x) => {
             let f = table.resolve_field(&x.value)?;
-            Ok(Some(f.column.column))
+            Ok(Some(f.into()))
         }
         SqlExpr::CompoundIdentifier(ident) => {
             let col_name = compound_ident(ident);
             let f = table.resolve_field(&col_name)?;
-            Ok(Some(f.column.column))
+            Ok(Some(f.into()))
         }
         _ => Ok(None),
     }
@@ -290,10 +285,10 @@ fn infer_number(field: Option<&ProductTypeElement>, value: &str, is_long: bool) 
 /// Compiles a [SqlExpr] expression into a [ColumnOp]
 fn compile_expr_value(table: &From, field: Option<&ProductTypeElement>, of: SqlExpr) -> Result<ColumnOp, PlanError> {
     Ok(ColumnOp::Field(match of {
-        SqlExpr::Identifier(name) => FieldExpr::Name(table.resolve_field(&name.value)?.field),
+        SqlExpr::Identifier(name) => FieldExpr::Name(table.resolve_field(&name.value)?.into()),
         SqlExpr::CompoundIdentifier(ident) => {
             let col_name = compound_ident(&ident);
-            table.resolve_field(&col_name)?.field.into()
+            FieldExpr::Name(table.resolve_field(&col_name)?.into())
         }
         SqlExpr::Value(x) => FieldExpr::Value(match x {
             Value::Number(value, is_long) => infer_number(field, &value, is_long)?,
@@ -340,8 +335,10 @@ fn compile_table_factor(table: TableFactor) -> Result<Table, PlanError> {
             alias,
             args,
             with_hints,
+            version,
+            partitions,
         } => {
-            unsupported!("TableFactor", alias, args, with_hints);
+            unsupported!("TableFactor", alias, args, with_hints, version, partitions);
 
             Ok(Table::new(name))
         }
@@ -407,22 +404,38 @@ fn compile_where(table: &From, filter: Option<SqlExpr>) -> Result<Option<Selecti
     }
 }
 
-/// Retrieves the [TableSchema] for the [Table]
-///
-/// Fails if the table `name` and/or `table_id` is not found
-fn find_table(db: &RelationalDB, tx: &MutTxId, t: Table) -> Result<TableSchema, PlanError> {
-    let table_id = db
-        .table_id_from_name(tx, &t.name)?
-        .ok_or(PlanError::UnknownTable { table: t.name.clone() })?;
-    if !db.inner.table_id_exists(tx, &TableId(table_id)) {
-        return Err(PlanError::UnknownTable { table: t.name });
+pub(crate) trait TableSchemaView {
+    fn find_table(&self, db: &RelationalDB, t: Table) -> Result<Cow<'_, TableSchema>, PlanError>;
+}
+
+impl TableSchemaView for Tx {
+    fn find_table(&self, db: &RelationalDB, t: Table) -> Result<Cow<'_, TableSchema>, PlanError> {
+        let table_id = db
+            .table_id_from_name(self, &t.name)?
+            .ok_or(PlanError::UnknownTable { table: t.name.clone() })?;
+        if !db.table_id_exists(self, &table_id) {
+            return Err(PlanError::UnknownTable { table: t.name });
+        }
+        db.schema_for_table(self, table_id)
+            .map_err(move |e| PlanError::DatabaseInternal(Box::new(e)))
     }
-    db.schema_for_table(tx, table_id)
-        .map_err(|e| PlanError::DatabaseInternal(Box::new(e)))
+}
+
+impl TableSchemaView for MutTx {
+    fn find_table(&self, db: &RelationalDB, t: Table) -> Result<Cow<'_, TableSchema>, PlanError> {
+        let table_id = db
+            .table_id_from_name_mut(self, &t.name)?
+            .ok_or(PlanError::UnknownTable { table: t.name.clone() })?;
+        if !db.table_id_exists_mut(self, &table_id) {
+            return Err(PlanError::UnknownTable { table: t.name });
+        }
+        db.schema_for_table_mut(self, table_id)
+            .map_err(|e| PlanError::DatabaseInternal(Box::new(e)))
+    }
 }
 
 /// Compiles the `FROM` clause
-fn compile_from(db: &RelationalDB, tx: &MutTxId, from: &[TableWithJoins]) -> Result<From, PlanError> {
+fn compile_from<T: TableSchemaView>(db: &RelationalDB, tx: &T, from: &[TableWithJoins]) -> Result<From, PlanError> {
     if from.len() > 1 {
         return Err(PlanError::Unsupported {
             feature: "Multiple tables in `FROM`.".into(),
@@ -437,14 +450,14 @@ fn compile_from(db: &RelationalDB, tx: &MutTxId, from: &[TableWithJoins]) -> Res
     };
 
     let t = compile_table_factor(root_table.relation.clone())?;
-    let base = find_table(db, tx, t)?;
+    let base = tx.find_table(db, t)?.into_owned();
     let mut base = From::new(base);
 
     for join in &root_table.joins {
         match &join.join_operator {
             JoinOperator::Inner(constraint) => {
                 let t = compile_table_factor(join.relation.clone())?;
-                let join = find_table(db, tx, t)?;
+                let join = tx.find_table(db, t)?.into_owned();
 
                 match constraint {
                     JoinConstraint::On(x) => {
@@ -542,7 +555,7 @@ fn compile_select_item(from: &From, select_item: SelectItem) -> Result<Column, P
 }
 
 /// Compiles the `SELECT ...` clause
-fn compile_select(db: &RelationalDB, tx: &MutTxId, select: Select) -> Result<SqlAst, PlanError> {
+fn compile_select<T: TableSchemaView>(db: &RelationalDB, tx: &T, select: Select) -> Result<SqlAst, PlanError> {
     let from = compile_from(db, tx, &select.from)?;
     // SELECT ...
     let mut project = Vec::new();
@@ -561,7 +574,7 @@ fn compile_select(db: &RelationalDB, tx: &MutTxId, select: Select) -> Result<Sql
 }
 
 /// Compiles any `query` clause (currently only `SELECT...`)
-fn compile_query(db: &RelationalDB, tx: &MutTxId, query: Query) -> Result<SqlAst, PlanError> {
+fn compile_query<T: TableSchemaView>(db: &RelationalDB, tx: &T, query: Query) -> Result<SqlAst, PlanError> {
     unsupported!(
         "SELECT",
         query.order_by,
@@ -614,14 +627,14 @@ fn compile_query(db: &RelationalDB, tx: &MutTxId, query: Query) -> Result<SqlAst
 }
 
 /// Compiles the `INSERT ...` clause
-fn compile_insert(
+fn compile_insert<T: TableSchemaView>(
     db: &RelationalDB,
-    tx: &MutTxId,
+    tx: &T,
     table_name: ObjectName,
     columns: Vec<Ident>,
     data: &Values,
 ) -> Result<SqlAst, PlanError> {
-    let table = find_table(db, tx, Table::new(table_name))?;
+    let table = tx.find_table(db, Table::new(table_name))?.into_owned();
 
     let columns = columns
         .into_iter()
@@ -649,14 +662,14 @@ fn compile_insert(
 }
 
 /// Compiles the `UPDATE ...` clause
-fn compile_update(
+fn compile_update<T: TableSchemaView>(
     db: &RelationalDB,
-    tx: &MutTxId,
+    tx: &T,
     table: Table,
     assignments: Vec<Assignment>,
     selection: Option<SqlExpr>,
 ) -> Result<SqlAst, PlanError> {
-    let table = From::new(find_table(db, tx, table)?);
+    let table = From::new(tx.find_table(db, table)?.into_owned());
     let selection = compile_where(&table, selection)?;
 
     let mut x = HashMap::with_capacity(assignments.len());
@@ -677,13 +690,13 @@ fn compile_update(
 }
 
 /// Compiles the `DELETE ...` clause
-fn compile_delete(
+fn compile_delete<T: TableSchemaView>(
     db: &RelationalDB,
-    tx: &MutTxId,
+    tx: &T,
     table: Table,
     selection: Option<SqlExpr>,
 ) -> Result<SqlAst, PlanError> {
-    let table = From::new(find_table(db, tx, table)?);
+    let table = From::new(tx.find_table(db, table)?.into_owned());
     let selection = compile_where(&table, selection)?;
 
     Ok(SqlAst::Delete {
@@ -751,9 +764,9 @@ fn column_def_type(named: &String, is_null: bool, data_type: &DataType) -> Resul
     Ok(if is_null { AlgebraicType::option(ty) } else { ty })
 }
 
-/// Extract the column attributes into [ColumnIndexAttribute]
-fn compile_column_option(col: &SqlColumnDef) -> Result<(bool, ColumnIndexAttribute), PlanError> {
-    let mut attr = ColumnIndexAttribute::UNSET;
+/// Extract the column attributes into [ColumnAttribute]
+fn compile_column_option(col: &SqlColumnDef) -> Result<(bool, Constraints), PlanError> {
+    let mut attr = Constraints::unset();
     let mut is_null = false;
 
     for x in &col.options {
@@ -765,11 +778,11 @@ fn compile_column_option(col: &SqlColumnDef) -> Result<(bool, ColumnIndexAttribu
                 is_null = false;
             }
             ColumnOption::Unique { is_primary } => {
-                attr = if *is_primary {
-                    ColumnIndexAttribute::PRIMARY_KEY
+                attr = attr.push(if *is_primary {
+                    Constraints::primary_key()
                 } else {
-                    ColumnIndexAttribute::UNIQUE
-                };
+                    Constraints::unique()
+                });
             }
             ColumnOption::Generated {
                 generated_as,
@@ -780,7 +793,7 @@ fn compile_column_option(col: &SqlColumnDef) -> Result<(bool, ColumnIndexAttribu
 
                 match generated_as {
                     GeneratedAs::ByDefault => {
-                        attr |= ColumnIndexAttribute::IDENTITY;
+                        attr = attr.push(Constraints::identity());
                     }
                     x => {
                         return Err(PlanError::Unsupported {
@@ -802,10 +815,10 @@ fn compile_column_option(col: &SqlColumnDef) -> Result<(bool, ColumnIndexAttribu
 
 /// Compiles the `CREATE TABLE ...` clause
 fn compile_create_table(table: Table, cols: Vec<SqlColumnDef>) -> Result<SqlAst, PlanError> {
-    let table = table.name;
-    let mut columns = ProductTypeMeta::with_capacity(cols.len());
+    let mut constraints = Vec::new();
 
-    for col in cols {
+    let mut columns = Vec::with_capacity(cols.len());
+    for (col_pos, col) in cols.into_iter().enumerate() {
         if column_size(&col).is_some() {
             return Err(PlanError::Unsupported {
                 feature: format!("Column with a defined size {}", col.name),
@@ -814,17 +827,26 @@ fn compile_create_table(table: Table, cols: Vec<SqlColumnDef>) -> Result<SqlAst,
 
         let name = col.name.to_string();
         let (is_null, attr) = compile_column_option(&col)?;
-        let ty = column_def_type(&name, is_null, &col.data_type)?;
 
-        columns.push(&name, ty, attr);
+        if attr.kind() != ConstraintKind::UNSET {
+            constraints.push(ConstraintDef::for_column(
+                &table.name,
+                &name,
+                attr,
+                ColList::new(col_pos.into()),
+            ));
+        }
+
+        let ty = column_def_type(&name, is_null, &col.data_type)?;
+        columns.push(ColumnDef {
+            col_name: name,
+            col_type: ty,
+        });
     }
 
-    Ok(SqlAst::CreateTable {
-        table_access: StAccess::for_name(&table),
-        table,
-        columns,
-        table_type: StTableType::User,
-    })
+    let table = TableDef::new(table.name, columns).with_constraints(constraints);
+
+    Ok(SqlAst::CreateTable { table })
 }
 
 /// Compiles the `DROP ...` clause
@@ -848,7 +870,7 @@ fn compile_drop(name: &ObjectName, kind: ObjectType) -> Result<SqlAst, PlanError
 }
 
 /// Compiles a `SQL` clause
-fn compile_statement(db: &RelationalDB, tx: &MutTxId, statement: Statement) -> Result<SqlAst, PlanError> {
+fn compile_statement<T: TableSchemaView>(db: &RelationalDB, tx: &T, statement: Statement) -> Result<SqlAst, PlanError> {
     match statement {
         Statement::Query(query) => Ok(compile_query(db, tx, *query)?),
         Statement::Insert {
@@ -946,6 +968,9 @@ fn compile_statement(db: &RelationalDB, tx: &MutTxId, statement: Statement) -> R
             on_commit,
             on_cluster,
             order_by,
+            comment,
+            auto_increment_offset,
+            strict,
         } => {
             if let Some(x) = &hive_formats {
                 if x.row_format
@@ -980,7 +1005,10 @@ fn compile_statement(db: &RelationalDB, tx: &MutTxId, statement: Statement) -> R
                 collation,
                 on_commit,
                 on_cluster,
-                order_by
+                order_by,
+                comment,
+                auto_increment_offset,
+                strict,
             );
             let table = Table::new(name);
             compile_create_table(table, columns)
@@ -992,8 +1020,9 @@ fn compile_statement(db: &RelationalDB, tx: &MutTxId, statement: Statement) -> R
             cascade,
             restrict,
             purge,
+            temporary,
         } => {
-            unsupported!("DROP", if_exists, cascade, purge, restrict);
+            unsupported!("DROP", if_exists, cascade, purge, restrict, temporary);
 
             if names.len() > 1 {
                 return Err(PlanError::Unsupported {
@@ -1016,7 +1045,11 @@ fn compile_statement(db: &RelationalDB, tx: &MutTxId, statement: Statement) -> R
 }
 
 /// Compiles a `sql` string into a `Vec<SqlAst>` using a SQL parser with [PostgreSqlDialect]
-pub(crate) fn compile_to_ast(db: &RelationalDB, tx: &MutTxId, sql_text: &str) -> Result<Vec<SqlAst>, DBError> {
+pub(crate) fn compile_to_ast<T: TableSchemaView>(
+    db: &RelationalDB,
+    tx: &T,
+    sql_text: &str,
+) -> Result<Vec<SqlAst>, DBError> {
     let dialect = PostgreSqlDialect {};
     let ast = Parser::parse_sql(&dialect, sql_text).map_err(|error| DBError::SqlParser {
         sql: sql_text.to_string(),

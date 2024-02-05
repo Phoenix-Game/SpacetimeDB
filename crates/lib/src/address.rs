@@ -1,10 +1,13 @@
 use anyhow::Context as _;
 use hex::FromHex as _;
-use sats::{impl_deserialize, impl_serialize, impl_st, AlgebraicType, ProductTypeElement};
+use sats::{impl_deserialize, impl_serialize, impl_st, AlgebraicType};
 use spacetimedb_bindings_macro::{Deserialize, Serialize};
+use spacetimedb_metrics::impl_prometheusvalue_string;
+use spacetimedb_metrics::typed_prometheus::AsPrometheusLabel;
 use std::{fmt, net::Ipv6Addr};
 
 use crate::sats;
+use spacetimedb_sats::hex::HexString;
 
 /// This is the address for a SpacetimeDB database or client connection.
 ///
@@ -20,13 +23,18 @@ pub struct Address {
     __address_bytes: [u8; 16],
 }
 
-impl_st!([] Address, _ts => AlgebraicType::product(vec![
-    ProductTypeElement::new_named(AlgebraicType::bytes(), "__address_bytes")
-]));
+impl_st!([] Address, _ts => AlgebraicType::product([("__address_bytes", AlgebraicType::bytes())]));
+impl_prometheusvalue_string!(Address);
+
+impl Default for Address {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
 
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_hex())
+        f.pad(&self.to_hex())
     }
 }
 
@@ -37,8 +45,6 @@ impl fmt::Debug for Address {
 }
 
 impl Address {
-    const ABBREVIATION_LEN: usize = 16;
-
     pub const ZERO: Self = Self {
         __address_bytes: [0; 16],
     };
@@ -47,10 +53,8 @@ impl Address {
         Self { __address_bytes: *arr }
     }
 
-    pub fn zero() -> Self {
-        Self {
-            __address_bytes: [0; 16],
-        }
+    pub const fn zero() -> Self {
+        Self::ZERO
     }
 
     pub fn from_u128(u: u128) -> Self {
@@ -63,12 +67,16 @@ impl Address {
             .map(|arr| Self::from_arr(&arr))
     }
 
-    pub fn to_hex(self) -> String {
-        hex::encode(self.as_slice())
+    pub fn to_hex(self) -> HexString<16> {
+        spacetimedb_sats::hex::encode(self.as_slice())
     }
 
-    pub fn to_abbreviated_hex(self) -> String {
-        self.to_hex()[0..Self::ABBREVIATION_LEN].to_owned()
+    pub fn abbreviate(&self) -> [u8; 8] {
+        self.as_slice()[..8].try_into().unwrap()
+    }
+
+    pub fn to_abbreviated_hex(self) -> HexString<8> {
+        spacetimedb_sats::hex::encode(&self.abbreviate())
     }
 
     pub fn from_slice(slice: impl AsRef<[u8]>) -> Self {
@@ -78,8 +86,8 @@ impl Address {
         Self::from_arr(&dst)
     }
 
-    pub fn as_slice(&self) -> [u8; 16] {
-        self.__address_bytes
+    pub fn as_slice(&self) -> &[u8; 16] {
+        &self.__address_bytes
     }
 
     pub fn to_ipv6(self) -> Ipv6Addr {
@@ -92,9 +100,7 @@ impl Address {
     }
 
     #[doc(hidden)]
-    pub fn __dummy() -> Self {
-        Self::zero()
-    }
+    pub const __DUMMY: Self = Self::ZERO;
 
     pub fn to_u128(&self) -> u128 {
         u128::from_be_bytes(self.__address_bytes)
@@ -132,7 +138,7 @@ impl serde::Serialize for AddressForUrl {
     where
         S: serde::Serializer,
     {
-        Address::from(*self).to_hex().serialize(serializer)
+        spacetimedb_sats::ser::serde::serialize_to(&Address::from(*self).as_slice(), serializer)
     }
 }
 
@@ -142,8 +148,29 @@ impl<'de> serde::Deserialize<'de> for AddressForUrl {
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        Address::from_hex(&s).map_err(serde::de::Error::custom).map(Self::from)
+        let arr = spacetimedb_sats::de::serde::deserialize_from(deserializer)?;
+        Ok(Address::from_arr(&arr).into())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Address {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        spacetimedb_sats::ser::serde::serialize_to(&self.as_slice(), serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Address {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let arr = spacetimedb_sats::de::serde::deserialize_from(deserializer)?;
+        Ok(Address::from_arr(&arr))
     }
 }
 

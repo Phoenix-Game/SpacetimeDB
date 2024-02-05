@@ -11,13 +11,13 @@ mod module;
 extern crate core;
 extern crate proc_macro;
 
-use std::collections::HashMap;
-use std::time::Duration;
-
-use bitflags::{bitflags, Flags};
+use bitflags::Flags;
 use module::{derive_deserialize, derive_satstype, derive_serialize};
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote, quote_spanned, TokenStreamExt};
+use spacetimedb_primitives::ColumnAttribute;
+use std::collections::HashMap;
+use std::time::Duration;
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
 use syn::{
@@ -103,11 +103,11 @@ fn route_input(input: MacroInput, item: TokenStream) -> syn::Result<TokenStream>
         MacroInput::Table => spacetimedb_table(item),
         MacroInput::Init => spacetimedb_init(item),
         MacroInput::Reducer { repeat } => spacetimedb_reducer(repeat, item),
-        MacroInput::Connect => spacetimedb_connect_disconnect(item, true),
-        MacroInput::Disconnect => spacetimedb_connect_disconnect(item, false),
-        MacroInput::Migrate => spacetimedb_migrate(item),
+        MacroInput::Connect => spacetimedb_special_reducer("__identity_connected__", item),
+        MacroInput::Disconnect => spacetimedb_special_reducer("__identity_disconnected__", item),
+        MacroInput::Migrate => spacetimedb_special_reducer("__migrate__", item),
         MacroInput::Index { ty, name, field_names } => spacetimedb_index(ty, name, field_names, item),
-        MacroInput::Update => spacetimedb_update(item),
+        MacroInput::Update => spacetimedb_special_reducer("__update__", item),
     }
 }
 
@@ -264,16 +264,12 @@ mod kw {
 
 /// Generates a reducer in place of `item`.
 fn spacetimedb_reducer(repeat: Option<Duration>, item: TokenStream) -> syn::Result<TokenStream> {
-    // TODO(kim): Find a better place for these. `core/host/wasm_common.rs` has similar
-    // definitions, but we can't depend on `core` here.
-    const RESERVED_REDUCER_NAMES: &[&str] = &["__init__", "__migrate__", "__update__"];
-
-    let repeat_dur = repeat.map_or(ReducerExtra::None, ReducerExtra::Repeat);
+    let repeat_dur = repeat.map_or(ReducerExtra::Schedule, ReducerExtra::Repeat);
     let original_function = syn::parse2::<ItemFn>(item)?;
 
-    // Extract reducer name, making sure it's not `__init__`.
+    // Extract reducer name, making sure it's not `__XXX__` as that's the form we reserve for special reducers.
     let reducer_name = original_function.sig.ident.to_string();
-    if RESERVED_REDUCER_NAMES.iter().any(|name| name == &reducer_name) {
+    if reducer_name.starts_with("__") && reducer_name.ends_with("__") {
         return Err(syn::Error::new_spanned(
             &original_function.sig.ident,
             "reserved reducer name",
@@ -287,13 +283,13 @@ fn spacetimedb_reducer(repeat: Option<Duration>, item: TokenStream) -> syn::Resu
 fn spacetimedb_init(item: TokenStream) -> syn::Result<TokenStream> {
     let original_function = syn::parse2::<ItemFn>(item)?;
 
-    gen_reducer(original_function, "__init__", ReducerExtra::Init)
+    gen_reducer(original_function, "__init__", ReducerExtra::None)
 }
 
 enum ReducerExtra {
     None,
+    Schedule,
     Repeat(Duration),
-    Init,
 }
 
 fn gen_reducer(original_function: ItemFn, reducer_name: &str, extra: ReducerExtra) -> syn::Result<TokenStream> {
@@ -306,7 +302,7 @@ fn gen_reducer(original_function: ItemFn, reducer_name: &str, extra: ReducerExtr
     // // TODO: better (non-string-based) validation for these
     // if !matches!(
     //     &*arg1.to_token_stream().to_string(),
-    //     "spacetimedb::spacetimedb_lib::hash::Hash" | "Hash"
+    //     "spacetimedb::spacetimedb_sats::hash::Hash" | "Hash"
     // ) {
     //     return Err(syn::Error::new_spanned(
     //         &arg1,
@@ -321,14 +317,18 @@ fn gen_reducer(original_function: ItemFn, reducer_name: &str, extra: ReducerExtr
     // }
 
     // Extract all function parameters, except for `self` ones that aren't allowed.
-    let args = original_function.sig.inputs.iter().map(|x| match x {
-        // TODO: improve error message!
-        FnArg::Receiver(_) => panic!(),
-        FnArg::Typed(x) => x,
-    });
+    let typed_args = original_function
+        .sig
+        .inputs
+        .iter()
+        .map(|arg| match arg {
+            FnArg::Typed(arg) => Ok(arg),
+            _ => Err(syn::Error::new_spanned(arg, "expected typed argument")),
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
 
     // Extract all function parameter names.
-    let arg_names = args.clone().map(|arg| {
+    let opt_arg_names = typed_args.iter().map(|arg| {
         if let syn::Pat::Ident(i) = &*arg.pat {
             let name = i.ident.to_string();
             quote!(Some(#name))
@@ -337,8 +337,7 @@ fn gen_reducer(original_function: ItemFn, reducer_name: &str, extra: ReducerExtr
         }
     });
 
-    // Extract all function parameter types.
-    let arg_tys = args.map(|arg| &arg.ty);
+    let arg_tys = typed_args.iter().map(|arg| arg.ty.as_ref()).collect::<Vec<_>>();
 
     // Extract the return type.
     let ret_ty = match &original_function.sig.output {
@@ -349,34 +348,49 @@ fn gen_reducer(original_function: ItemFn, reducer_name: &str, extra: ReducerExtr
 
     let register_describer_symbol = format!("__preinit__20_register_describer_{reducer_name}");
 
-    let (epilogue, repeater_impl) = match &extra {
-        ReducerExtra::None | ReducerExtra::Init => (quote!(), quote!()),
-        ReducerExtra::Repeat(repeat_dur) => {
-            let repeat_dur = duration_totokens(*repeat_dur);
-            let epilogue = quote! {
-                if _res.is_ok() {
-                    spacetimedb::rt::schedule_repeater::<_, _, #func_name>(#func_name)
-                }
-            };
-            let repeater_impl = quote! {
-                impl spacetimedb::rt::RepeaterInfo for #func_name {
-                    const REPEAT_INTERVAL: ::core::time::Duration = #repeat_dur;
-                }
-            };
-            (epilogue, repeater_impl)
-        }
-    };
+    let mut epilogue = TokenStream::new();
+    let mut extra_impls = TokenStream::new();
+
+    if !matches!(extra, ReducerExtra::None) {
+        let arg_names = typed_args
+            .iter()
+            .enumerate()
+            .map(|(i, arg)| match &*arg.pat {
+                syn::Pat::Ident(pat) => pat.ident.clone(),
+                _ => format_ident!("__arg{}", i),
+            })
+            .collect::<Vec<_>>();
+
+        extra_impls.extend(quote!(impl #func_name {
+            pub fn schedule(__time: spacetimedb::Timestamp #(, #arg_names: #arg_tys)*) -> spacetimedb::ScheduleToken<#func_name> {
+                spacetimedb::rt::schedule(__time, (#(#arg_names,)*))
+            }
+        }));
+    }
+
+    if let ReducerExtra::Repeat(repeat_dur) = &extra {
+        let repeat_dur = duration_totokens(*repeat_dur);
+        epilogue.extend(quote! {
+            if _res.is_ok() {
+                spacetimedb::rt::schedule_repeater::<_, _, #func_name>(#func_name)
+            }
+        });
+        extra_impls.extend(quote! {
+            impl spacetimedb::rt::RepeaterInfo for #func_name {
+                const REPEAT_INTERVAL: ::core::time::Duration = #repeat_dur;
+            }
+        });
+    }
 
     let generated_function = quote! {
-        // NOTE: double-underscoring names here is unnecessary, as Rust macros are hygienic.
         fn __reducer(
             __sender: spacetimedb::sys::Buffer,
             __caller_address: spacetimedb::sys::Buffer,
             __timestamp: u64,
             __args: &[u8]
         ) -> spacetimedb::sys::Buffer {
-            #(spacetimedb::rt::assert_reducerarg::<#arg_tys>();)*
-            #(spacetimedb::rt::assert_reducerret::<#ret_ty>();)*
+            #(spacetimedb::rt::assert_reducer_arg::<#arg_tys>();)*
+            #(spacetimedb::rt::assert_reducer_ret::<#ret_ty>();)*
             spacetimedb::rt::invoke_reducer(
                 #func_name,
                 __sender,
@@ -395,56 +409,21 @@ fn gen_reducer(original_function: ItemFn, reducer_name: &str, extra: ReducerExtr
         }
     };
 
-    let mut schedule_func_sig = original_function.sig.clone();
-    let schedule_func_body = {
-        schedule_func_sig.ident = format_ident!("schedule");
-        schedule_func_sig.output = syn::ReturnType::Type(
-            Token![->](Span::call_site()),
-            Box::new(syn::parse_quote!(spacetimedb::ScheduleToken<#func_name>)),
-        );
-        let arg_names = schedule_func_sig.inputs.iter_mut().enumerate().map(|(i, arg)| {
-            let syn::FnArg::Typed(arg) = arg else { panic!() };
-            match &mut *arg.pat {
-                syn::Pat::Ident(id) => {
-                    id.by_ref = None;
-                    id.mutability = None;
-                    id.ident.clone()
-                }
-                _ => {
-                    let ident = format_ident!("__arg{}", i);
-                    arg.pat = Box::new(syn::parse_quote!(#ident));
-                    ident
-                }
-            }
-        });
-        let schedule_args = quote!((#(#arg_names,)*));
-        let time_arg = format_ident!("__time");
-        schedule_func_sig
-            .inputs
-            .insert(0, syn::parse_quote!(#time_arg: spacetimedb::Timestamp));
-        quote! {
-            spacetimedb::rt::schedule(#time_arg, #schedule_args)
-        }
-    };
-
     Ok(quote! {
         const _: () = {
             #generated_describe_function
         };
         #[allow(non_camel_case_types)]
         #vis struct #func_name { _never: ::core::convert::Infallible }
-        impl #func_name {
-            #vis #schedule_func_sig { #schedule_func_body }
-        }
         impl spacetimedb::rt::ReducerInfo for #func_name {
             const NAME: &'static str = #reducer_name;
-            const ARG_NAMES: &'static [Option<&'static str>] = &[#(#arg_names),*];
+            const ARG_NAMES: &'static [Option<&'static str>] = &[#(#opt_arg_names),*];
             const INVOKE: spacetimedb::rt::ReducerFn = {
                 #generated_function
                 __reducer
             };
         }
-        #repeater_impl
+        #extra_impls
         #original_function
     })
 }
@@ -453,27 +432,7 @@ fn gen_reducer(original_function: ItemFn, reducer_name: &str, extra: ReducerExtr
 struct Column<'a> {
     index: u8,
     field: &'a module::SatsField<'a>,
-    attr: ColumnIndexAttribute,
-}
-
-// TODO: any way to avoid duplication with same structure in bindings crate? Extra crate?
-bitflags! {
-    #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
-    struct ColumnIndexAttribute: u8 {
-        const UNSET = Self::empty().bits();
-        ///  Index no unique
-        const INDEXED = 0b0001;
-        /// Generate the next [Sequence]
-        const AUTO_INC = 0b0010;
-        /// Index unique
-        const UNIQUE = Self::INDEXED.bits() | 0b0100;
-        /// Unique + AutoInc
-        const IDENTITY = Self::UNIQUE.bits() | Self::AUTO_INC.bits();
-        /// Primary key column (implies Unique)
-        const PRIMARY_KEY = Self::UNIQUE.bits() | 0b1000;
-        /// PrimaryKey + AutoInc
-        const PRIMARY_KEY_AUTO = Self::PRIMARY_KEY.bits() | Self::AUTO_INC.bits();
-    }
+    attr: ColumnAttribute,
 }
 
 fn spacetimedb_table(item: TokenStream) -> syn::Result<TokenStream> {
@@ -554,8 +513,8 @@ fn spacetimedb_tabletype_impl(item: syn::DeriveInput) -> syn::Result<TokenStream
     let mut columns = Vec::<Column>::new();
 
     let get_table_id_func = quote! {
-        fn table_id() -> u32 {
-            static TABLE_ID: spacetimedb::rt::OnceCell<u32> = spacetimedb::rt::OnceCell::new();
+        fn table_id() -> spacetimedb::TableId {
+            static TABLE_ID: spacetimedb::rt::OnceCell<spacetimedb::TableId> = spacetimedb::rt::OnceCell::new();
             *TABLE_ID.get_or_init(|| {
                 spacetimedb::get_table_id(<Self as spacetimedb::TableType>::TABLE_NAME)
             })
@@ -567,19 +526,19 @@ fn spacetimedb_tabletype_impl(item: syn::DeriveInput) -> syn::Result<TokenStream
             .try_into()
             .map_err(|_| syn::Error::new_spanned(field.ident, "too many columns; the most a table can have is 256"))?;
 
-        let mut col_attr = ColumnIndexAttribute::UNSET;
+        let mut col_attr = ColumnAttribute::UNSET;
         for attr in field.original_attrs {
             let Some(attr) = ColumnAttr::parse(attr)? else { continue };
             let duplicate = |span| syn::Error::new(span, "duplicate attribute");
             let (extra_col_attr, span) = match attr {
-                ColumnAttr::Unique(span) => (ColumnIndexAttribute::UNIQUE, span),
-                ColumnAttr::Autoinc(span) => (ColumnIndexAttribute::AUTO_INC, span),
-                ColumnAttr::Primarykey(span) => (ColumnIndexAttribute::PRIMARY_KEY, span),
+                ColumnAttr::Unique(span) => (ColumnAttribute::UNIQUE, span),
+                ColumnAttr::Autoinc(span) => (ColumnAttribute::AUTO_INC, span),
+                ColumnAttr::Primarykey(span) => (ColumnAttribute::PRIMARY_KEY, span),
             };
             // do those attributes intersect (not counting the INDEXED bit which is present in all attributes)?
             // this will check that no two attributes both have UNIQUE, AUTOINC or PRIMARY_KEY bits set
             if !(col_attr & extra_col_attr)
-                .difference(ColumnIndexAttribute::INDEXED)
+                .difference(ColumnAttribute::INDEXED)
                 .is_empty()
             {
                 return Err(duplicate(span));
@@ -587,7 +546,7 @@ fn spacetimedb_tabletype_impl(item: syn::DeriveInput) -> syn::Result<TokenStream
             col_attr |= extra_col_attr;
         }
 
-        if col_attr.contains(ColumnIndexAttribute::AUTO_INC) {
+        if col_attr.contains(ColumnAttribute::AUTO_INC) {
             let valid_for_autoinc = if let syn::Type::Path(p) = field.ty {
                 // TODO: this is janky as heck
                 matches!(
@@ -632,16 +591,15 @@ fn spacetimedb_tabletype_impl(item: syn::DeriveInput) -> syn::Result<TokenStream
             })
             .collect::<syn::Result<Vec<_>>>()?;
         let name = name.as_deref().unwrap_or("default_index");
-        indexes.push(quote!(spacetimedb::IndexDef {
+        indexes.push(quote!(spacetimedb::IndexDesc {
             name: #name,
-            ty: spacetimedb::spacetimedb_lib::IndexType::#ty,
+            ty: spacetimedb::sats::db::def::IndexType::#ty,
             col_ids: &[#(#col_ids),*],
         }));
     }
 
-    let (unique_columns, nonunique_columns): (Vec<_>, Vec<_>) = columns
-        .iter()
-        .partition(|x| x.attr.contains(ColumnIndexAttribute::UNIQUE));
+    let (unique_columns, nonunique_columns): (Vec<_>, Vec<_>) =
+        columns.iter().partition(|x| x.attr.contains(ColumnAttribute::UNIQUE));
 
     let has_unique = !unique_columns.is_empty();
 
@@ -736,7 +694,7 @@ fn spacetimedb_tabletype_impl(item: syn::DeriveInput) -> syn::Result<TokenStream
     let schema_impl = derive_satstype(&sats_ty, false);
     let column_attrs = columns.iter().map(|col| {
         Ident::new(
-            ColumnIndexAttribute::FLAGS
+            ColumnAttribute::FLAGS
                 .iter()
                 .find_map(|f| (col.attr == *f.value()).then_some(f.name()))
                 .expect("Invalid column attribute"),
@@ -746,10 +704,10 @@ fn spacetimedb_tabletype_impl(item: syn::DeriveInput) -> syn::Result<TokenStream
     let tabletype_impl = quote! {
         impl spacetimedb::TableType for #original_struct_ident {
             const TABLE_NAME: &'static str = #table_name;
-            const COLUMN_ATTRS: &'static [spacetimedb::spacetimedb_lib::ColumnIndexAttribute] = &[
-                #(spacetimedb::spacetimedb_lib::ColumnIndexAttribute::#column_attrs),*
+            const COLUMN_ATTRS: &'static [spacetimedb::sats::db::attr::ColumnAttribute] = &[
+                #(spacetimedb::sats::db::attr::ColumnAttribute::#column_attrs),*
             ];
-            const INDEXES: &'static [spacetimedb::IndexDef<'static>] = &[#(#indexes),*];
+            const INDEXES: &'static [spacetimedb::IndexDesc<'static>] = &[#(#indexes),*];
             type InsertResult = #insert_result;
             #get_table_id_func
         }
@@ -880,48 +838,9 @@ fn spacetimedb_index(
     Ok(output)
 }
 
-fn spacetimedb_migrate(item: TokenStream) -> syn::Result<TokenStream> {
+fn spacetimedb_special_reducer(name: &str, item: TokenStream) -> syn::Result<TokenStream> {
     let original_function = syn::parse2::<ItemFn>(item)?;
-    gen_reducer(original_function, "__migrate__", ReducerExtra::None)
-}
-
-fn spacetimedb_update(item: TokenStream) -> syn::Result<TokenStream> {
-    let original_function = syn::parse2::<ItemFn>(item)?;
-    gen_reducer(original_function, "__update__", ReducerExtra::None)
-}
-
-fn spacetimedb_connect_disconnect(item: TokenStream, connect: bool) -> syn::Result<TokenStream> {
-    let original_function = syn::parse2::<ItemFn>(item)?;
-    let func_name = &original_function.sig.ident;
-    let connect_disconnect_symbol = if connect {
-        "__identity_connected__"
-    } else {
-        "__identity_disconnected__"
-    };
-
-    let emission = quote! {
-        const _: () = {
-            #[export_name = #connect_disconnect_symbol]
-            extern "C" fn __connect_disconnect(
-                __sender: spacetimedb::sys::Buffer,
-                __caller_address: spacetimedb::sys::Buffer,
-                __timestamp: u64,
-            ) -> spacetimedb::sys::Buffer {
-                spacetimedb::rt::invoke_connection_func(#func_name, __sender, __caller_address, __timestamp)
-            }
-        };
-
-        #original_function
-    };
-
-    if std::env::var("PROC_MACRO_DEBUG").is_ok() {
-        {
-            #![allow(clippy::disallowed_macros)]
-            println!("{}", emission);
-        }
-    }
-
-    Ok(emission)
+    gen_reducer(original_function, name, ReducerExtra::None)
 }
 
 #[proc_macro]

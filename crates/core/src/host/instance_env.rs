@@ -1,23 +1,26 @@
-use nonempty::NonEmpty;
 use parking_lot::{Mutex, MutexGuard};
-use spacetimedb_lib::{bsatn, ProductValue};
+use smallvec::SmallVec;
+use spacetimedb_table::table::UniqueConstraintViolation;
 use std::ops::DerefMut;
 use std::sync::Arc;
 
+use super::scheduler::{ScheduleError, ScheduledReducerId, Scheduler};
+use super::timestamp::Timestamp;
 use crate::database_instance_context::DatabaseInstanceContext;
 use crate::database_logger::{BacktraceProvider, LogLevel, Record};
 use crate::db::datastore::locking_tx_datastore::MutTxId;
-use crate::db::datastore::traits::{DataRow, IndexDef};
 use crate::error::{IndexError, NodesError};
+use crate::execution_context::ExecutionContext;
 use crate::util::ResultInspectExt;
-
-use super::scheduler::{ScheduleError, ScheduledReducerId, Scheduler};
-use super::timestamp::Timestamp;
-use crate::vm::DbProgram;
+use crate::vm::{DbProgram, TxMode};
 use spacetimedb_lib::filter::CmpArgs;
 use spacetimedb_lib::identity::AuthCtx;
 use spacetimedb_lib::operator::OpQuery;
-use spacetimedb_lib::relation::{FieldExpr, FieldName};
+use spacetimedb_lib::{bsatn, ProductValue};
+use spacetimedb_primitives::{ColId, ColListBuilder, TableId};
+use spacetimedb_sats::buffer::BufWriter;
+use spacetimedb_sats::db::def::{IndexDef, IndexType};
+use spacetimedb_sats::relation::{FieldExpr, FieldName};
 use spacetimedb_sats::{ProductType, Typespace};
 use spacetimedb_vm::expr::{Code, ColumnOp};
 
@@ -31,6 +34,56 @@ pub struct InstanceEnv {
 #[derive(Clone, Default)]
 pub struct TxSlot {
     inner: Arc<Mutex<Option<MutTxId>>>,
+}
+
+#[derive(Default)]
+struct ChunkedWriter {
+    chunks: Vec<Box<[u8]>>,
+    scratch_space: Vec<u8>,
+}
+
+impl BufWriter for ChunkedWriter {
+    fn put_slice(&mut self, slice: &[u8]) {
+        self.scratch_space.extend_from_slice(slice);
+    }
+}
+
+impl ChunkedWriter {
+    /// Reserves `len` additional bytes in the scratch space,
+    /// or does nothing if the capacity is already sufficient.
+    fn reserve_in_scratch(&mut self, len: usize) {
+        self.scratch_space.reserve(len);
+    }
+
+    /// Flushes the data collected in the scratch space if it's larger than our
+    /// chunking threshold.
+    pub fn flush(&mut self) {
+        // For now, just send buffers over a certain fixed size.
+        const ITER_CHUNK_SIZE: usize = 64 * 1024;
+
+        if self.scratch_space.len() > ITER_CHUNK_SIZE {
+            // We intentionally clone here so that our scratch space is not
+            // recreated with zero capacity (via `Vec::new`), but instead can
+            // be `.clear()`ed in-place and reused.
+            //
+            // This way the buffers in `chunks` are always fitted fixed-size to
+            // the actual data they contain, while the scratch space is ever-
+            // growing and has higher chance of fitting each next row without
+            // reallocation.
+            self.chunks.push(self.scratch_space.as_slice().into());
+            self.scratch_space.clear();
+        }
+    }
+
+    /// Finalises the writer and returns all the chunks.
+    pub fn into_chunks(mut self) -> Vec<Box<[u8]>> {
+        if !self.scratch_space.is_empty() {
+            // Avoid extra clone by just shrinking and pushing the scratch space
+            // in-place.
+            self.chunks.push(self.scratch_space.into());
+        }
+        self.chunks
+    }
 }
 
 // Generic 'instance environment' delegated to from various host types.
@@ -64,25 +117,24 @@ impl InstanceEnv {
 
     #[tracing::instrument(skip_all)]
     pub fn console_log(&self, level: LogLevel, record: &Record, bt: &dyn BacktraceProvider) {
-        self.dbic.logger.lock().unwrap().write(level, record, bt);
+        self.dbic.logger.write(level, record, bt);
         log::trace!("MOD({}): {}", self.dbic.address.to_abbreviated_hex(), record.message);
     }
 
-    pub fn insert(&self, table_id: u32, buffer: &[u8]) -> Result<ProductValue, NodesError> {
+    pub fn insert(&self, ctx: &ExecutionContext, table_id: TableId, buffer: &[u8]) -> Result<ProductValue, NodesError> {
         let stdb = &*self.dbic.relational_db;
         let tx = &mut *self.get_tx()?;
-
         let ret = stdb
             .insert_bytes_as_row(tx, table_id, buffer)
             .inspect_err_(|e| match e {
-                crate::error::DBError::Index(IndexError::UniqueConstraintViolation {
+                crate::error::DBError::Index(IndexError::UniqueConstraintViolation(UniqueConstraintViolation {
                     constraint_name: _,
                     table_name: _,
-                    col_names: _,
+                    cols: _,
                     value: _,
-                }) => {}
+                })) => {}
                 _ => {
-                    let res = stdb.table_name_from_id(tx, table_id);
+                    let res = stdb.table_name_from_id(ctx, tx, table_id);
                     if let Ok(Some(table_name)) = res {
                         log::debug!("insert(table: {table_name}, table_id: {table_id}): {e}")
                     } else {
@@ -94,57 +146,18 @@ impl InstanceEnv {
         Ok(ret)
     }
 
-    /*
-    #[tracing::instrument(skip_all)]
-    pub fn delete_pk(&self, table_id: u32, buffer: &[u8]) -> Result<(), NodesError> {
-        self.measure(table_id, &INSTANCE_ENV_DELETE_PK);
-
-        // Decode the primary key.
-        let primary_key = PrimaryKey::decode(&mut &buffer[..]).map_err(NodesError::DecodePrimaryKey)?;
-        // TODO: Actually delete the primary key?
-        Err(NodesError::PrimaryKeyNotFound(primary_key))
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub fn delete_value(&self, table_id: u32, buffer: &[u8]) -> Result<(), NodesError> {
-        let measure = self.measure(table_id, &INSTANCE_ENV_DELETE_VALUE);
-
-        let stdb = &*self.dbic.relational_db;
-        let tx = &mut *self.get_tx()?;
-
-        let schema = stdb.row_schema_for_table(tx, table_id)?;
-        let row = ProductValue::decode(&schema, &mut &buffer[..]).map_err(NodesError::DecodeRow)?;
-
-        let row_id = row.to_data_key();
-        // todo: check that res is true, but for now it always is
-        let res = stdb
-            .delete_pk(tx, table_id, row_id)
-            .inspect_err_(|e| log::error!("delete_value(table_id: {table_id}): {e}"))?;
-
-        self.with_trace_log(|l| {
-            l.delete_value(
-                measure.start_instant.unwrap(),
-                measure.elapsed(),
-                table_id,
-                buffer.into(),
-                res,
-            )
-        });
-
-        if res {
-            Ok(())
-        } else {
-            Err(NodesError::PrimaryKeyNotFound(PrimaryKey { data_key: row_id }))
-        }
-    }
-    */
-
     /// Deletes all rows in the table identified by `table_id`
     /// where the column identified by `cols` equates to `value`.
     ///
-    /// Returns an error if no columns were deleted or if the column wasn't found.
-    #[tracing::instrument(skip(self, value))]
-    pub fn delete_by_col_eq(&self, table_id: u32, col_id: u32, value: &[u8]) -> Result<u32, NodesError> {
+    /// Returns an error if no rows were deleted or if the column wasn't found.
+    #[tracing::instrument(skip(self, ctx, value))]
+    pub fn delete_by_col_eq(
+        &self,
+        ctx: &ExecutionContext,
+        table_id: TableId,
+        col_id: ColId,
+        value: &[u8],
+    ) -> Result<u32, NodesError> {
         let stdb = &*self.dbic.relational_db;
         let tx = &mut *self.get_tx()?;
 
@@ -152,114 +165,69 @@ impl InstanceEnv {
         let eq_value = stdb.decode_column(tx, table_id, col_id, value)?;
 
         // Find all rows in the table where the column data equates to `value`.
-        let seek = stdb.iter_by_col_eq(tx, table_id, col_id, eq_value)?;
-        let seek = seek.map(|x| stdb.data_to_owned(x).into()).collect::<Vec<_>>();
+        let rows_to_delete = stdb
+            .iter_by_col_eq_mut(ctx, tx, table_id, col_id, eq_value)?
+            .map(|row_ref| row_ref.pointer())
+            // `delete_by_field` only cares about 1 element,
+            // so optimize for that.
+            .collect::<SmallVec<[_; 1]>>();
 
-        // Delete them and count how many we deleted and error if none.
-        let count = stdb
-            .delete_by_rel(tx, table_id, seek)
-            .inspect_err_(|e| log::error!("delete_by_col_eq(table_id: {table_id}): {e}"))?
-            .ok_or(NodesError::ColumnValueNotFound)?;
-
-        Ok(count)
+        // Delete them and count how many we deleted.
+        Ok(stdb.delete(tx, table_id, rows_to_delete))
     }
 
-    /*
-    #[tracing::instrument(skip_all)]
-    pub fn delete_range(
-        &self,
-        table_id: u32,
-        cols: u32,
-        start_buffer: &[u8],
-        end_buffer: &[u8],
-    ) -> Result<u32, NodesError> {
-        let measure = self.measure(table_id, &INSTANCE_ENV_DELETE_RANGE);
-
+    /// Deletes all rows in the table identified by `table_id`
+    /// where the rows match one in `relation`
+    /// which is a bsatn encoding of `Vec<ProductValue>`.
+    ///
+    /// Returns an error if no rows were deleted.
+    #[tracing::instrument(skip(self, relation))]
+    pub fn delete_by_rel(&self, table_id: TableId, relation: &[u8]) -> Result<u32, NodesError> {
         let stdb = &*self.dbic.relational_db;
         let tx = &mut *self.get_tx()?;
 
-        let col_type = stdb.schema_for_column(tx, table_id, cols)?;
+        // Find the row schema using it to decode a vector of product values.
+        let row_ty = stdb.row_schema_for_table(tx, table_id)?;
+        // `TableType::delete` cares about a single element
+        // so in that case we can avoid the allocation by using `smallvec`.
+        let relation = ProductValue::decode_smallvec(&row_ty, &mut &*relation).map_err(NodesError::DecodeRow)?;
 
-        let decode = |b: &[u8]| AlgebraicValue::decode(&col_type, &mut &b[..]).map_err(NodesError::DecodeValue);
-        let start = decode(start_buffer)?;
-        let end = decode(end_buffer)?;
-
-        let range = stdb.range_scan(tx, table_id, cols, start..end)?;
-        let range = range.map(|x| stdb.data_to_owned(x).into()).collect::<Vec<_>>();
-
-        let count = stdb.delete_in(tx, table_id, range)?.ok_or(NodesError::RangeNotFound)?;
-
-        self.with_trace_log(|l| {
-            l.delete_range(
-                measure.start_instant.unwrap(),
-                measure.elapsed(),
-                table_id,
-                cols,
-                start_buffer.into(),
-                end_buffer.into(),
-                count,
-            )
-        });
-
-        Ok(count)
+        // Delete them and return how many we deleted.
+        Ok(stdb.delete_by_rel(tx, table_id, relation))
     }
-
-    #[tracing::instrument(skip_all)]
-    pub fn create_table(&self, _table_name: &str, _schema_bytes: &[u8]) -> Result<u32, NodesError> {
-        // let now = SystemTime::now();
-
-        // let stdb = &*self.dbic.relational_db;
-        // let tx = &mut *self.get_tx()?;
-
-        unimplemented!()
-        // let schema = ProductType::decode(&mut &schema_bytes[..]).map_err(NodesError::DecodeSchema)?;
-
-        // let table_id = stdb.create_table(tx, table_name, schema)?;
-
-        // self.with_trace_log(|l| {
-        //     l.create_table(
-        //         now,
-        //         now.elapsed().unwrap(),
-        //         table_name.into(),
-        //         schema_bytes.into(),
-        //         table_id,
-        //     );
-        // });
-
-        // Ok(table_id)
-    }
-    */
 
     /// Returns the `table_id` associated with the given `table_name`.
     ///
     /// Errors with `TableNotFound` if the table does not exist.
     #[tracing::instrument(skip_all)]
-    pub fn get_table_id(&self, table_name: String) -> Result<u32, NodesError> {
+    pub fn get_table_id(&self, table_name: &str) -> Result<TableId, NodesError> {
         let stdb = &*self.dbic.relational_db;
         let tx = &mut *self.get_tx()?;
 
         // Query the table id from the name.
         let table_id = stdb
-            .table_id_from_name(tx, &table_name)?
+            .table_id_from_name_mut(tx, table_name)?
             .ok_or(NodesError::TableNotFound)?;
 
         Ok(table_id)
     }
 
-    /// Creates an index of type `index_type`,
+    /// Creates an index of type `index_type` and name `index_name`,
     /// on a product of the given columns in `col_ids`,
     /// in the table identified by `table_id`.
     ///
-    /// Currently only btree index type are supported.
+    /// Currently only single-column-indices are supported.
+    /// That is, `col_ids.len() == 1`, or the call will panic.
     ///
-    /// The `table_name` is used together with the column ids to construct the name of the index.
-    /// As only single-column-indices are supported right now,
-    /// the name will be in the format `{table_name}_{cols}`.
+    /// Another limitation is on the `index_type`.
+    /// Only `btree` indices are supported as of now, i.e., `index_type == 0`.
+    /// When `index_type == 1` is passed, the call will happen
+    /// and on `index_type > 1`, an error is returned.
     #[tracing::instrument(skip_all)]
     pub fn create_index(
         &self,
         index_name: String,
-        table_id: u32,
+        table_id: TableId,
         index_type: u8,
         col_ids: Vec<u8>,
     ) -> Result<(), NodesError> {
@@ -268,28 +236,31 @@ impl InstanceEnv {
 
         // TODO(george) This check should probably move towards src/db/index, but right
         // now the API is pretty hardwired towards btrees.
-        //
-        // TODO(george) Dedup the constant here.
+        let index_type = IndexType::try_from(index_type).map_err(|_| NodesError::BadIndexType(index_type))?;
         match index_type {
-            0 => (),
-            1 => todo!("Hash indexes not yet supported"),
-            _ => return Err(NodesError::BadIndexType(index_type)),
+            IndexType::BTree => {}
+            IndexType::Hash => {
+                todo!("Hash indexes not yet supported")
+            }
         };
 
-        let cols = NonEmpty::from_slice(&col_ids)
-            .expect("Attempt to create an index with zero columns")
-            .map(|x| x as u32);
+        let columns = col_ids
+            .into_iter()
+            .map(Into::into)
+            .collect::<ColListBuilder>()
+            .build()
+            .expect("Attempt to create an index with zero columns");
 
-        let is_unique = stdb.column_attrs(tx, table_id, &cols)?.is_unique();
+        let is_unique = stdb.column_constraints(tx, table_id, &columns)?.has_unique();
 
         let index = IndexDef {
-            table_id,
-            cols,
-            name: index_name,
+            columns,
+            index_name,
             is_unique,
+            index_type,
         };
 
-        stdb.create_index(tx, index)?;
+        stdb.create_index(tx, table_id, index)?;
 
         Ok(())
     }
@@ -302,7 +273,13 @@ impl InstanceEnv {
     /// Matching is defined by decoding of `value` to an `AlgebraicValue`
     /// according to the column's schema and then `Ord for AlgebraicValue`.
     #[tracing::instrument(skip_all)]
-    pub fn iter_by_col_eq(&self, table_id: u32, col_id: u32, value: &[u8]) -> Result<Vec<u8>, NodesError> {
+    pub fn iter_by_col_eq(
+        &self,
+        ctx: &ExecutionContext,
+        table_id: TableId,
+        col_id: ColId,
+        value: &[u8],
+    ) -> Result<Vec<u8>, NodesError> {
         let stdb = &*self.dbic.relational_db;
         let tx = &mut *self.get_tx()?;
 
@@ -311,66 +288,43 @@ impl InstanceEnv {
 
         // Find all rows in the table where the column data matches `value`.
         // Concatenate and return these rows using bsatn encoding.
-        let results = stdb.iter_by_col_eq(tx, table_id, col_id, value)?;
+        let results = stdb.iter_by_col_eq_mut(ctx, tx, table_id, col_id, value)?;
         let mut bytes = Vec::new();
         for result in results {
-            bsatn::to_writer(&mut bytes, result.view()).unwrap();
+            // Pre-allocate the capacity needed to write `result`.
+            bytes.reserve(bsatn::to_len(&result).unwrap());
+            // Write the ref directly to the BSATN `bytes` buffer.
+            bsatn::to_writer(&mut bytes, &result).unwrap();
         }
         Ok(bytes)
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn iter(&self, table_id: u32) -> impl Iterator<Item = Result<Vec<u8>, NodesError>> {
-        use genawaiter::{sync::gen, yield_, GeneratorState};
+    pub fn iter_chunks(&self, ctx: &ExecutionContext, table_id: TableId) -> Result<Vec<Box<[u8]>>, NodesError> {
+        let mut chunked_writer = ChunkedWriter::default();
 
-        // Cheap Arc clones to untie the returned iterator from our own lifetime.
-        let relational_db = self.dbic.relational_db.clone();
-        let tx = self.tx.clone();
+        let stdb = &*self.dbic.relational_db;
+        let tx = &mut *self.tx.get()?;
 
-        // For now, just send buffers over a certain fixed size.
-        fn should_yield_buf(buf: &Vec<u8>) -> bool {
-            const SIZE: usize = 64 * 1024;
-            buf.len() >= SIZE
+        for row in stdb.iter_mut(ctx, tx, table_id)? {
+            // Pre-allocate the capacity needed to write `row`.
+            chunked_writer.reserve_in_scratch(bsatn::to_len(&row).unwrap());
+            // Write the ref directly to the BSATN `chunked_writer` buffer.
+            bsatn::to_writer(&mut chunked_writer, &row).unwrap();
+            // Flush at row boundaries.
+            chunked_writer.flush();
         }
 
-        let mut generator = Some(gen!({
-            let stdb = &*relational_db;
-            let tx = &mut *tx.get()?;
-
-            let mut buf = Vec::new();
-            let schema = stdb.row_schema_for_table(tx, table_id)?;
-            schema.encode(&mut buf);
-            yield_!(buf);
-
-            let mut buf = Vec::new();
-            for row in stdb.iter(tx, table_id)? {
-                if should_yield_buf(&buf) {
-                    yield_!(buf);
-                    buf = Vec::new();
-                }
-                row.view().encode(&mut buf);
-            }
-            if !buf.is_empty() {
-                yield_!(buf)
-            }
-
-            Ok(())
-        }));
-
-        std::iter::from_fn(move || match generator.as_mut()?.resume() {
-            GeneratorState::Yielded(bytes) => Some(Ok(bytes)),
-            GeneratorState::Complete(res) => {
-                generator = None;
-                match res {
-                    Ok(()) => None,
-                    Err(err) => Some(Err(err)),
-                }
-            }
-        })
+        Ok(chunked_writer.into_chunks())
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn iter_filtered(&self, table_id: u32, filter: &[u8]) -> Result<impl Iterator<Item = Vec<u8>>, NodesError> {
+    pub fn iter_filtered_chunks(
+        &self,
+        ctx: &ExecutionContext,
+        table_id: TableId,
+        filter: &[u8],
+    ) -> Result<Vec<Box<[u8]>>, NodesError> {
         use spacetimedb_lib::filter;
 
         fn filter_to_column_op(table_name: &str, filter: filter::Expr) -> ColumnOp {
@@ -403,8 +357,9 @@ impl InstanceEnv {
         let stdb = &self.dbic.relational_db;
         let tx = &mut *self.tx.get()?;
 
-        let schema = stdb.schema_for_table(tx, table_id)?;
-        let row_type = ProductType::from(&schema);
+        let schema = stdb.schema_for_table_mut(tx, table_id)?;
+        let row_type = ProductType::from(&*schema);
+
         let filter = filter::Expr::from_bytes(
             // TODO: looks like module typespace is currently not hooked up to instances;
             // use empty typespace for now which should be enough for primitives
@@ -414,16 +369,24 @@ impl InstanceEnv {
             filter,
         )
         .map_err(NodesError::DecodeFilter)?;
-        let q = spacetimedb_vm::dsl::query(&schema).with_select(filter_to_column_op(&schema.table_name, filter));
+        let q = spacetimedb_vm::dsl::query(&*schema).with_select(filter_to_column_op(&schema.table_name, filter));
         //TODO: How pass the `caller` here?
-        let p = &mut DbProgram::new(stdb, tx, AuthCtx::for_current(self.dbic.identity));
+        let mut tx: TxMode = tx.into();
+        let p = &mut DbProgram::new(ctx, stdb, &mut tx, AuthCtx::for_current(self.dbic.identity));
         let results = match spacetimedb_vm::eval::run_ast(p, q.into()) {
             Code::Table(table) => table,
             _ => unreachable!("query should always return a table"),
         };
-        Ok(std::iter::once(bsatn::to_vec(&row_type))
-            .chain(results.data.into_iter().map(|row| bsatn::to_vec(&row.data)))
-            .map(|bytes| bytes.expect("encoding algebraic values should never fail")))
+
+        let mut chunked_writer = ChunkedWriter::default();
+
+        // write all rows and flush at row boundaries
+        for row in results.data {
+            row.data.encode(&mut chunked_writer);
+            chunked_writer.flush();
+        }
+
+        Ok(chunked_writer.into_chunks())
     }
 }
 

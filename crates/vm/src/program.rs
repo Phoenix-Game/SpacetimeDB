@@ -2,7 +2,8 @@
 //!
 //! It carries an [EnvDb] with the functions, idents, types.
 use spacetimedb_lib::identity::AuthCtx;
-use spacetimedb_lib::relation::{MemTable, RelIter, Relation, Table};
+use spacetimedb_lib::Address;
+use spacetimedb_sats::relation::{MemTable, RelIter, Relation, Table};
 use std::collections::HashMap;
 
 use crate::env::EnvDb;
@@ -18,9 +19,9 @@ use crate::rel_ops::RelOps;
 /// A trait to allow split the execution of `programs` to allow executing
 /// `queries` that take in account each `program` state/enviroment.
 ///
-/// In concrete, it allows to run queries that run on the `SpaceTimeDb` engine.
+/// To be specific, it allows you to run queries that run on the `SpacetimeDB` engine.
 ///
-/// It could also permite run queries backed by different engines, like in `MySql`.
+/// It could also permit run queries backed by different engines, like in `MySql`.
 pub trait ProgramVm {
     /// Load the in-built functions that define the operators of the VM,
     /// like `+`, `and`, `==`, etc.
@@ -66,6 +67,7 @@ pub trait ProgramVm {
         env.functions.ops = ops
     }
 
+    fn address(&self) -> Option<Address>;
     fn env(&self) -> &EnvDb;
     fn env_mut(&mut self) -> &mut EnvDb;
     fn ctx(&self) -> &dyn ProgramVm;
@@ -151,6 +153,10 @@ impl Program {
 }
 
 impl ProgramVm for Program {
+    fn address(&self) -> Option<Address> {
+        None
+    }
+
     fn env(&self) -> &EnvDb {
         &self.env
     }
@@ -171,7 +177,7 @@ impl ProgramVm for Program {
     fn eval_query(&mut self, query: CrudCode) -> Result<Code, ErrorVm> {
         match query {
             CrudCode::Query(query) => {
-                let head = query.head();
+                let head = query.head().clone();
                 let row_count = query.row_count();
                 let table_access = query.table.table_access();
                 let result = match query.table {
@@ -186,7 +192,7 @@ impl ProgramVm for Program {
                 let head = result.head().clone();
                 let rows: Vec<_> = result.collect_vec()?;
 
-                Ok(Code::Table(MemTable::new(&head, table_access, &rows)))
+                Ok(Code::Table(MemTable::new(head, table_access, rows)))
             }
             CrudCode::Insert { .. } => {
                 todo!()
